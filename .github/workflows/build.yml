@@ -17,7 +17,7 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: lin
-          - os: macos-latest
+          - os: macos-13
             platform: mac
           - os: windows-latest
             platform: win
@@ -35,16 +35,16 @@ jobs:
       - name: Download Rack SDK
         shell: bash
         run: |
-          RACK_VERSION="2.5.2"
+          RACK_VERSION="2.6.6"
           if [ "${{ matrix.platform }}" == "lin" ]; then
-            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz
-            tar -C .. -x -f Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz
+            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz"
+            tar -C .. -x -f "Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz"
           elif [ "${{ matrix.platform }}" == "mac" ]; then
-            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-mac-x64.tar.gz
-            tar -C .. -x -f Rack-SDK-${RACK_VERSION}-mac-x64.tar.gz
+            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-mac-x64.zip"
+            unzip -q "Rack-SDK-${RACK_VERSION}-mac-x64.zip" -d ..
           elif [ "${{ matrix.platform }}" == "win" ]; then
-            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-win-x64.zip
-            unzip -q Rack-SDK-${RACK_VERSION}-win-x64.zip -d ..
+            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-win-x64.zip"
+            unzip -q "Rack-SDK-${RACK_VERSION}-win-x64.zip" -d ..
           fi
 
       - name: Build plugin

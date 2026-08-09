@@ -1,0 +1,60 @@
+name: Build VCV Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: lin
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up environment (Linux)
+        if: matrix.platform == 'lin'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglu1-mesa-dev libxi-dev
+
+      - name: Download Rack SDK
+        shell: bash
+        run: |
+          RACK_VERSION="2.5.2"
+          if [ "${{ matrix.platform }}" == "lin" ]; then
+            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz
+            tar -C .. -x -f Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz
+          elif [ "${{ matrix.platform }}" == "mac" ]; then
+            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-mac-x64.tar.gz
+            tar -C .. -x -f Rack-SDK-${RACK_VERSION}-mac-x64.tar.gz
+          elif [ "${{ matrix.platform }}" == "win" ]; then
+            curl -O https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-win-x64.zip
+            unzip -q Rack-SDK-${RACK_VERSION}-win-x64.zip -d ..
+          fi
+
+      - name: Build plugin
+        shell: bash
+        run: |
+          export RACK_DIR="../Rack-SDK"
+          make dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ matrix.platform }}
+          path: dist/*.vcvplugin

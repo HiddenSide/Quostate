@@ -6,13 +6,13 @@
   "license": "GPL-3.0-or-later",
   "author": "Esteban Gomez",
   "authorEmail": "estebanmolca@gmail.com",
-  "sourceUrl": "",
+  "sourceUrl": "https://github.com/HiddenSide/Quostate",
   "modules": [
     {
       "slug": "LSystem",
       "name": "LSystem",
       "description": "sequencer that uses rules which can self-trigger or trigger other rules",
-      "manualUrl": "https://ToDo.com",
+      "manualUrl": "https://github.com/HiddenSide/Quostate/blob/main/LSystem_manual_EN.md",
       "tags": ["Sequencer", "Random", "Quantizer"]
     }
   ]

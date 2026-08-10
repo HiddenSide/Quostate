@@ -17,10 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: lin
+            sdk: lin-x64
           - os: macos-latest
-            platform: mac
+            platform: mac-x64
+            sdk: mac-x64
+          - os: macos-latest
+            platform: mac-arm64
+            sdk: mac-arm64
           - os: windows-latest
             platform: win
+            sdk: win-x64
 
     steps:
       - name: Checkout code
@@ -36,16 +42,8 @@ jobs:
         shell: bash
         run: |
           RACK_VERSION="2.6.6"
-          if [ "${{ matrix.platform }}" == "lin" ]; then
-            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.zip"
-            unzip -q "Rack-SDK-${RACK_VERSION}-lin-x64.zip" -d ..
-          elif [ "${{ matrix.platform }}" == "mac" ]; then
-            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-mac-x64.zip"
-            unzip -q "Rack-SDK-${RACK_VERSION}-mac-x64.zip" -d ..
-          elif [ "${{ matrix.platform }}" == "win" ]; then
-            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-win-x64.zip"
-            unzip -q "Rack-SDK-${RACK_VERSION}-win-x64.zip" -d ..
-          fi
+          curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-${{ matrix.sdk }}.zip"
+          unzip -q "Rack-SDK-${RACK_VERSION}-${{ matrix.sdk }}.zip" -d ..
 
       - name: Build plugin
         shell: bash

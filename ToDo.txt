@@ -1,7 +1,0 @@
-El modulo funciona bien y ya esta casi para publicarlo.
-Unos cambios:
-Cambiar la salida 'Eos' a nombre 'Rule' y que entregue un voltaje de 0 a 10 volts segun el numero de regla que este actualmente reproduciendose en el canal. Veo este comportamiento mucho mas util. 
-
-Permitir k en <>, ejemplo: 1,1 -> <2,k,r:0.2>,1
-
-

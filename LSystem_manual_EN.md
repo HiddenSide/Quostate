@@ -121,6 +121,7 @@ These same format rules and limits apply exactly the same way to the values ente
 ## Context Menu Options:
 
 **Polyphony channels**: Allows selecting from 1 channel (default) up to 6 independent channels for the V/Oct, Gate, Rule, and Eor outputs.
+
 **Reset when starting playback**: Resets the module whenever playback is started by the Run Toggle input or the Run button. Enabled by default.
 
 **If a note has no rule...** Selects between jumping to the first rule (default) or jumping to a random one when the last degree of a rule has no targets in the initiators.

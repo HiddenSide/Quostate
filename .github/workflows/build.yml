@@ -37,8 +37,8 @@ jobs:
         run: |
           RACK_VERSION="2.6.6"
           if [ "${{ matrix.platform }}" == "lin" ]; then
-            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz"
-            tar -C .. -x -f "Rack-SDK-${RACK_VERSION}-lin-x64.tar.gz"
+            curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-lin-x64.zip"
+            unzip -q "Rack-SDK-${RACK_VERSION}-lin-x64.zip" -d ..
           elif [ "${{ matrix.platform }}" == "mac" ]; then
             curl -fL -O "https://vcvrack.com/downloads/Rack-SDK-${RACK_VERSION}-mac-x64.zip"
             unzip -q "Rack-SDK-${RACK_VERSION}-mac-x64.zip" -d ..

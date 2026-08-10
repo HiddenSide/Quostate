@@ -17,7 +17,7 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: lin
-          - os: macos-13
+          - os: macos-latest
             platform: mac
           - os: windows-latest
             platform: win

@@ -49,7 +49,11 @@ jobs:
         shell: bash
         run: |
           export RACK_DIR="../Rack-SDK"
-          make dist
+          if [ "${{ matrix.platform }}" == "mac-x64" ]; then
+            arch -x86_64 make dist
+          else
+            make dist
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

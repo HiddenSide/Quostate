@@ -110,13 +110,13 @@ struct LSystemModule : Module {
         // las capacidades: iniciador, grados fijos, silencio, aleatorio simple,
         // listas aleatorias ponderadas (grado y duración), k (recordar el último
         // aleatorio), desplazamientos cromáticos +N/-N y repetición *N.
-        fieldText[0] = "1,1 -> 1,1/2 3,1/2 5,1/2 <3,5,7:2>,1/2";
-        fieldText[1] = "3,1/2 -> 3,1/4^1,1/4 s,1/4 1,1";
-        fieldText[2] = "5,1/2 -> r,1/4 k,1/4 <8:3,2:1>,1/2";
-        fieldText[3] = "8,1/2 -> k+2,1/4 k-2,1/4 <1:3,4:1>,1";
-        fieldText[4] = "7,1/2 -> <1:2,r:1>,1/4 k,1/4 1,1 *2";
-        fieldText[5] = "4,1 -> r,1/2 k,1/2 1,1";
-        fieldText[6] = "2,1/2 -> r,1/2 k,1/2 1,1";
+        fieldText[0] = "1,1 -> r,1/2 <3,5,7>,1/2";
+        fieldText[1] = "3,1/2 -> k+2,1/4 k,1/4 1,1/2 *2";
+        fieldText[2] = "5,1/2 -> <1:2,r:1>,1/2 k,k";
+        fieldText[3] = "7,1/2 -> 8,1/4 7,1/4 5,1/2";
+        fieldText[4] = "8,1/4 -> k+1,1/4 k-1,1/4 s,1/4";
+        fieldText[5] = "s,1/2 -> 1,1/2";
+        fieldText[6] = "1,1/4 -> <2,4,6:2>,<1/4:2,1/8:1> k,k *2";
 
         for (int i = 0; i < NUM_FIELDS; i++) fieldTextCommitted[i] = fieldText[i];
 
@@ -361,7 +361,13 @@ struct LSystemModule : Module {
 
         ticksRemaining[ch] = std::max(1, ev.key.durationTicks) - 1;
 
-        if (ev.key.grade.isRest) {
+        if (ev.silent) {
+            // Duration-0 step kept only to drive rule-routing (see engine
+            // expandOnce()): consumes its floored tick, but must not appear
+            // as a note -- leave V/Oct and Gate untouched, and don't carry
+            // any glide-in-progress through it.
+            gliding[ch] = false;
+        } else if (ev.key.grade.isRest) {
             gateHigh[ch] = false;
             gliding[ch] = false;
         } else {

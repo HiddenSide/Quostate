@@ -115,8 +115,10 @@ You can specify from the context menu whether a reset is applied every time the 
 The Eval input allows external control over rule sequencing and transitions. Its behavior is configured from the context menu (Eval input mode):
 
 **Rule select (0-10V CV)**: (Default) Accepts a 0 to 10V control voltage mapped 1:1 with 
-the Rule output (0V = Rule 1... 10V = Rule 7). 
-During normal playback, transitions are queued: when the currently active rule finishes (EOR), it jumps to the selected target rule instead of evaluating its normal exit degree. 
+the Rule output (0V = Rule 1... 10V = Rule 7. If the voltage is negative (-1V or less) this input has no effect).  
+
+During normal playback, transitions are queued: when the currently active rule finishes (EOR), it jumps to the selected target rule instead of evaluating its normal exit degree.
+ 
 If a trigger arrives at the Reset input while Eval is connected, it performs an immediate hard jump directly to step 1 of the target rule. If this input receives a monophonic signal, it acts equally on all channels.
 
 **Loop / Hold rule (Gate)**: While a high gate (>2V) is held at the Eval input, the currently active rule repeats in an infinite loop. When the gate goes low (0V), normal L-system evaluation resumes at the end of the rule.

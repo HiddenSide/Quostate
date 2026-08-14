@@ -64,6 +64,10 @@ struct ResolvedEvent {
     RuleKey key;
     bool hasGlide = false;
     GradeValue glideTarget;
+    // True for a step written with a literal '0' duration that had to be kept
+    // (as the very last step of a production) purely so its grade can drive
+    // rule-routing. The module must skip V/Oct + Gate updates for it.
+    bool silent = false;
 
     ResolvedEvent() = default;
     ResolvedEvent(RuleKey k) : key(k) {}
@@ -78,11 +82,12 @@ struct RuleKeyHash {
     }
 };
 
-enum class SpecKind { FIXED, RANDOM_ANY, RANDOM_LIST, LAST_RANDOM };
+enum class SpecKind { FIXED, RANDOM_ANY, RANDOM_LIST, LAST_RANDOM, LAST_LIST };
 
 struct WeightedGradeItem {
     bool isRandom = false;
     bool isLastRandom = false; // 'k' inside a <...> list
+    bool isLastList = false;   // 'l' inside a <...> list
     GradeValue value;
     double weight = 1.0;
 };
@@ -90,6 +95,7 @@ struct WeightedGradeItem {
 struct WeightedDurationItem {
     bool isRandom = false;
     bool isLastRandom = false; // 'k' inside a <...> list
+    bool isLastList = false;   // 'l' inside a <...> list
     int ticks = 0;
     double weight = 1.0;
 };
@@ -114,6 +120,7 @@ struct GradeSpec {
 struct DurationSpec {
     SpecKind kind = SpecKind::FIXED;
     int fixedTicks = 0;
+    bool zeroMarker = false; // true if this FIXED duration was literally '0' (skip marker)
     std::vector<WeightedDurationItem> items;
 };
 
@@ -196,7 +203,7 @@ inline bool parseBoundedInt(const std::string& tokRaw, int& out, int limit = MAX
     }
 }
 
-inline bool parseDurationTicks(const std::string& tokRaw, int& outTicks) {
+inline bool parseDurationTicks(const std::string& tokRaw, int& outTicks, bool* wasZero = nullptr) {
     std::string tok = trim(tokRaw);
     static const std::regex fracRe("^(\\d+)/(\\d+)$");
     std::smatch m;
@@ -214,6 +221,7 @@ inline bool parseDurationTicks(const std::string& tokRaw, int& outTicks) {
         return false;
     }
     if (!std::isfinite(cycles)) return false;
+    if (wasZero) *wasZero = (cycles == 0.0);
     // Clamp before rounding: extreme values here would otherwise overflow the
     // long->int conversion below (implementation-defined/UB on such values).
     double ticksD = cycles * PPQN;
@@ -247,6 +255,10 @@ inline bool parseGradeSpecBase(const std::string& strRaw, GradeSpec& out) {
         out.kind = SpecKind::LAST_RANDOM;
         return true;
     }
+    if (str == "l") {
+        out.kind = SpecKind::LAST_LIST;
+        return true;
+    }
     if (!str.empty() && str.front() == '<' && str.back() == '>') {
         std::string inner = str.substr(1, str.size() - 2);
         out.kind = SpecKind::RANDOM_LIST;
@@ -266,6 +278,8 @@ inline bool parseGradeSpecBase(const std::string& strRaw, GradeSpec& out) {
                 item.isRandom = true;
             } else if (valStr == "k") {
                 item.isLastRandom = true;
+            } else if (valStr == "l") {
+                item.isLastList = true;
             } else {
                 if (!parseGradeValue(valStr, item.value)) return false;
             }
@@ -308,6 +322,10 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
         out.kind = SpecKind::LAST_RANDOM;
         return true;
     }
+    if (str == "l") {
+        out.kind = SpecKind::LAST_LIST;
+        return true;
+    }
     if (!str.empty() && str.front() == '<' && str.back() == '>') {
         std::string inner = str.substr(1, str.size() - 2);
         out.kind = SpecKind::RANDOM_LIST;
@@ -327,6 +345,8 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
                 item.isRandom = true;
             } else if (valStr == "k") {
                 item.isLastRandom = true;
+            } else if (valStr == "l") {
+                item.isLastList = true;
             } else {
                 if (!parseDurationTicks(valStr, item.ticks)) return false;
             }
@@ -335,7 +355,7 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
         return !out.items.empty();
     }
     out.kind = SpecKind::FIXED;
-    return parseDurationTicks(str, out.fixedTicks);
+    return parseDurationTicks(str, out.fixedTicks, &out.zeroMarker);
 }
 
 inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::string& error) {
@@ -466,6 +486,8 @@ public:
         eosFired = false;
         lastRandomGrade = 1;
         lastRandomDuration = PPQN;
+        lastListGrade = 1;
+        lastListDuration = PPQN;
         productionCycleIndex.clear();
         // Starting the sequence from the top isn't a completion event: suppress
         // EOR/EOS on the very first rule that fires after this reset (it's
@@ -490,6 +512,40 @@ public:
         return true;
     }
 
+    bool isQueueEmpty() const { return queue.empty(); }
+    RuleKey getLastFiredKey() const { return lastFiredKey; }
+    int getLastFiredFieldIndex() const { return lastFiredFieldIndex; }
+    void setCurrentKey(RuleKey k) { current = k; }
+    void setForcedFieldIndex(int idx) { forcedFieldIndex = idx; }
+    void resetTo(RuleKey k) {
+        current = k;
+        forcedFieldIndex = -1;
+        queue.clear();
+        firedThisStep = false;
+        eorFired = false;
+        eosFired = false;
+        lastRandomGrade = 1;
+        lastRandomDuration = PPQN;
+        lastListGrade = 1;
+        lastListDuration = PPQN;
+        productionCycleIndex.clear();
+        suppressEndSignalsOnce = true;
+    }
+    void resetToField(int fieldIdx, RuleKey k) {
+        current = k;
+        forcedFieldIndex = fieldIdx;
+        queue.clear();
+        firedThisStep = false;
+        eorFired = false;
+        eosFired = false;
+        lastRandomGrade = 1;
+        lastRandomDuration = PPQN;
+        lastListGrade = 1;
+        lastListDuration = PPQN;
+        productionCycleIndex.clear();
+        suppressEndSignalsOnce = true;
+    }
+
     RuleKey getCurrentKey() const { return current; }
 
     bool firedThisStep = false;
@@ -497,6 +553,7 @@ public:
     bool eosFired = false;
     RuleKey lastFiredKey;
     int lastFiredFieldIndex = -1; // the actual field row that fired, or -1 if unknown
+    int forcedFieldIndex = -1;    // if >= 0, forces the next expansion to evaluate this exact row
     int maxExpansions = 200;
     bool suppressEndSignalsOnce = false; // true right after reset(), until the first firing
 
@@ -545,6 +602,10 @@ private:
                 GradeValue v; v.isRest = false; v.value = lastRandomGrade;
                 return v;
             }
+            case SpecKind::LAST_LIST: {
+                GradeValue v; v.isRest = false; v.value = lastListGrade;
+                return v;
+            }
             case SpecKind::RANDOM_ANY: {
                 GradeValue v; v.isRest = false; v.value = randomGradeAny();
                 return v;
@@ -559,6 +620,7 @@ private:
         switch (spec.kind) {
             case SpecKind::FIXED: return spec.fixedTicks;
             case SpecKind::LAST_RANDOM: return lastRandomDuration;
+            case SpecKind::LAST_LIST: return lastListDuration;
             case SpecKind::RANDOM_ANY: return randomDurationAny();
             case SpecKind::RANDOM_LIST: return pickWeightedDuration(spec.items);
         }
@@ -607,24 +669,28 @@ private:
         for (auto& it : items) total += it.weight;
         std::uniform_real_distribution<double> dist(0.0, total);
         double r = dist(rng), acc = 0;
+        GradeValue result;
+        bool found = false;
         for (auto& it : items) {
             acc += it.weight;
             if (r <= acc) {
-                if (it.isRandom) {
-                    GradeValue v; v.isRest = false; v.value = randomGradeAny();
-                    return v;
-                }
-                if (it.isLastRandom) {
-                    GradeValue v; v.isRest = false; v.value = lastRandomGrade;
-                    return v;
-                }
-                return it.value;
+                if (it.isRandom) { result.isRest = false; result.value = randomGradeAny(); }
+                else if (it.isLastRandom) { result.isRest = false; result.value = lastRandomGrade; }
+                else if (it.isLastList) { result.isRest = false; result.value = lastListGrade; }
+                else { result = it.value; }
+                found = true;
+                break;
             }
         }
-        const auto& last = items.back();
-        if (last.isRandom) { GradeValue v; v.isRest = false; v.value = randomGradeAny(); return v; }
-        if (last.isLastRandom) { GradeValue v; v.isRest = false; v.value = lastRandomGrade; return v; }
-        return last.value;
+        if (!found) {
+            const auto& last = items.back();
+            if (last.isRandom) { result.isRest = false; result.value = randomGradeAny(); }
+            else if (last.isLastRandom) { result.isRest = false; result.value = lastRandomGrade; }
+            else if (last.isLastList) { result.isRest = false; result.value = lastListGrade; }
+            else { result = last.value; }
+        }
+        lastListGrade = result.value; // 'l' recalls this, no matter which branch produced it
+        return result;
     }
 
     int pickWeightedDuration(const std::vector<WeightedDurationItem>& items) {
@@ -632,18 +698,28 @@ private:
         for (auto& it : items) total += it.weight;
         std::uniform_real_distribution<double> dist(0.0, total);
         double r = dist(rng), acc = 0;
+        int result = 0;
+        bool found = false;
         for (auto& it : items) {
             acc += it.weight;
             if (r <= acc) {
-                if (it.isRandom) return randomDurationAny();
-                if (it.isLastRandom) return lastRandomDuration;
-                return it.ticks;
+                if (it.isRandom) result = randomDurationAny();
+                else if (it.isLastRandom) result = lastRandomDuration;
+                else if (it.isLastList) result = lastListDuration;
+                else result = it.ticks;
+                found = true;
+                break;
             }
         }
-        const auto& last = items.back();
-        if (last.isRandom) return randomDurationAny();
-        if (last.isLastRandom) return lastRandomDuration;
-        return last.ticks;
+        if (!found) {
+            const auto& last = items.back();
+            if (last.isRandom) result = randomDurationAny();
+            else if (last.isLastRandom) result = lastRandomDuration;
+            else if (last.isLastList) result = lastListDuration;
+            else result = last.ticks;
+        }
+        lastListDuration = result; // 'l' recalls this, no matter which branch produced it
+        return result;
     }
 
     const Production& pickProduction(const RuleKey& key, const std::vector<Production>& list, size_t& usedIndexOut) {
@@ -669,11 +745,35 @@ private:
     ExpandResult expandOnce() {
         const std::vector<Production>* prodList = nullptr;
         RuleKey matchedKey = current;
-        auto it = rules.find(current);
-        if (it != rules.end()) {
-            prodList = &it->second;
-        } else {
-            prodList = findByGrade(current, matchedKey);
+        size_t usedIndex = 0;
+        bool forceMatched = false;
+
+        if (forcedFieldIndex >= 0) {
+            for (auto& kv : keyFieldIndices) {
+                for (size_t p = 0; p < kv.second.size(); p++) {
+                    if (kv.second[p] == forcedFieldIndex) {
+                        matchedKey = kv.first;
+                        auto rIt = rules.find(matchedKey);
+                        if (rIt != rules.end() && p < rIt->second.size()) {
+                            prodList = &rIt->second;
+                            usedIndex = p;
+                            forceMatched = true;
+                            break;
+                        }
+                    }
+                }
+                if (forceMatched) break;
+            }
+            forcedFieldIndex = -1; // consume forced row
+        }
+
+        if (!forceMatched) {
+            auto it = rules.find(current);
+            if (it != rules.end()) {
+                prodList = &it->second;
+            } else {
+                prodList = findByGrade(current, matchedKey);
+            }
         }
 
         if (!prodList) {
@@ -692,8 +792,7 @@ private:
         firedThisStep = true;
         if (!suppressEndSignalsOnce) eorFired = true;
 
-        size_t usedIndex = 0;
-        const Production& prod = pickProduction(matchedKey, *prodList, usedIndex);
+        const Production& prod = forceMatched ? (*prodList)[usedIndex] : pickProduction(matchedKey, *prodList, usedIndex);
         auto fieldsIt = keyFieldIndices.find(matchedKey);
         lastFiredFieldIndex = (fieldsIt != keyFieldIndices.end() && usedIndex < fieldsIt->second.size())
             ? fieldsIt->second[usedIndex] : -1;
@@ -721,8 +820,26 @@ private:
                 resolvedTicks[i] = resolveDuration(sym.duration);
             }
             for (size_t i = 0; i < n; i++) {
+                const Symbol& sym = prod.symbols[i];
+                bool isZeroStep = (sym.duration.kind == SpecKind::FIXED && sym.duration.zeroMarker);
+                bool isVeryLast = (rep == prod.repeatCount - 1) && (i == n - 1);
+
+                if (isZeroStep && !isVeryLast) {
+                    // Fully omitted: no audible/timed footprint at all, as if this
+                    // step were never written. Its grade is still resolved above,
+                    // so any glide targeting it still works correctly.
+                    continue;
+                }
+
                 ResolvedEvent ev(resolvedGrades[i], resolvedTicks[i]);
-                if (prod.symbols[i].glideToNext && i + 1 < n) {
+                if (isZeroStep) {
+                    // Only reachable when isVeryLast: kept purely to drive
+                    // rule-routing once dequeued. Can't be truly zero-time --
+                    // one tick is needed before the next rule can be evaluated --
+                    // but the module must not treat it as a real note.
+                    ev.silent = true;
+                }
+                if (sym.glideToNext && i + 1 < n) {
                     ev.hasGlide = true;
                     ev.glideTarget = resolvedGrades[i + 1];
                 }
@@ -748,6 +865,8 @@ private:
 
     int lastRandomGrade = 1;
     int lastRandomDuration = PPQN;
+    int lastListGrade = 1;      // last value produced by ANY <...> list, for 'l'
+    int lastListDuration = PPQN;
 
     std::mt19937 rng{std::random_device{}()};
 };

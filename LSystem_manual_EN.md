@@ -31,7 +31,7 @@ Notice in the example that the duration of the last degree of Rule 1 and the dur
 
 A rule whose last degree number isn't defined as the initiator of any other rule will jump to the first rule or to a random one (available as an option in the context menu).
 
-## Using `r` (random) and `k` (last random value):
+## Using `r` (random), `k` (last random value) and `l` (random value in a list):
 The character `r` can be used to specify a random value at any step of a rule: in the degree, the duration, or both at once. Every time `r` is evaluated, it takes a random value between predefined limits in the module's engine, if the corresponding pool is empty. Otherwise, it randomly picks one of the values specified in the pool.
 
 A character that complements `r` is `k`. When `k` is used in the degree, duration, or both, it takes the last value that `r` produced in that respective field — in the same rule or any previously executed rule — or defaults to 1 if `r` was never evaluated. Here:
@@ -39,6 +39,8 @@ A character that complements `r` is `k`. When `k` is used in the degree, duratio
 `1,1->r,r k,k`
 
 `k` will repeat, in the second step, both the degree and the duration that were randomly selected in the first step.
+
+You can also use `l` which returns the last degree chosen from a list.
 
 ## Adding and subtracting degrees (`+` and `-`) and octaves:
 An integer can be added to or subtracted from a degree (or from a list of degrees, explained further below) to raise or lower it. If the result of that operation goes past one end of the limits (set from the context menu), the value wraps around to the opposite end (like a cyclic counter), continuing from there instead of stopping at the limit.
@@ -110,10 +112,16 @@ The Reset button, and its corresponding input, restart the sequence of every cha
 You can specify from the context menu whether a reset is applied every time the sequence is started with the Run button or the Run Toggle input.
 
 ### Eval Input:
-The `Eval` input allows external control over rule sequencing and transitions. Its behavior is configured from the context menu (`Eval input mode`):
-- **Rule select (0-10V CV)**: (Default) Accepts a 0 to 10V control voltage mapped 1:1 with the `Rule` output ($0\text{V} = \text{Rule 1} \dots 10\text{V} = \text{Rule 7}$). During normal playback, transitions are queued: when the currently active rule finishes (EOR), it jumps to the selected target rule instead of evaluating its normal exit degree. If a trigger arrives at the `Reset` input while `Eval` is connected, it performs an immediate hard jump directly to step 1 of the target rule.
-- **Loop / Hold rule (Gate)**: While a high gate ($>2\text{V}$) is held at the `Eval` input, the currently active rule repeats in an infinite loop. When the gate goes low ($0\text{V}$), normal L-system evaluation resumes at the end of the rule.
-- **Advance on trigger (Trigger)**: The module loops the active rule until a trigger pulse is received at `Eval`, at which point the next rule transition is evaluated.
+The Eval input allows external control over rule sequencing and transitions. Its behavior is configured from the context menu (Eval input mode):
+
+**Rule select (0-10V CV)**: (Default) Accepts a 0 to 10V control voltage mapped 1:1 with 
+the Rule output (0V = Rule 1... 10V = Rule 7). 
+During normal playback, transitions are queued: when the currently active rule finishes (EOR), it jumps to the selected target rule instead of evaluating its normal exit degree. 
+If a trigger arrives at the Reset input while Eval is connected, it performs an immediate hard jump directly to step 1 of the target rule. If this input receives a monophonic signal, it acts equally on all channels.
+
+**Loop / Hold rule (Gate)**: While a high gate (>2V) is held at the Eval input, the currently active rule repeats in an infinite loop. When the gate goes low (0V), normal L-system evaluation resumes at the end of the rule.
+
+**Advance on trigger (Trigger)**: The module loops the active rule until a trigger pulse is received at Eval, at which point the next rule transition is evaluated.
 
 ## Durations: allowed values and limits.
 Time unit: the module works internally in ticks, where 48 ticks = "1" (one beat/quarter note, since it's designed for 48 PPQN at the clock). Everything you write as a duration is converted to ticks on that basis.
@@ -142,11 +150,9 @@ These same format rules and limits apply exactly the same way to the values ente
 
 **Random degree range(r)**: Allows selecting from various predefined limits within which `r` will pick its value if the [Random pool for r(Degrees)] input is empty. Also applies limits to the `'+'` and `-` operators. `-8 to 16` by default.
 
-**Randomize rules style**: Selects the generative profile used when generating rules with "Randomize Rules":
-- *Melodic (Song Form)*: Structured phrases, balanced ratios, harmonic anchoring.
-- *Acid / Techno / Polyrhythmic*: Fast pulses (`1/4`, `1/8`, `1/3`), percussive rests `s`, glides `^`, and evolutionary `*4` transpositions (`k+1`, `k-1`).
-- *Ambient / Evolving*: Floating durations, modal spread, glides and `*2`/`*4` expansions.
-- *Complex L-System*: Full DSL exploitation with `<...>` weighted lists, memories `k`/`l`, and dynamic branch routing.
+**Randomize rules style**: Selects the generative profile used when generating rules with "Randomize Rules".
+
+**Randomize rules**: Randomizes all rules according to the chosen style. The seed input must be empty to generate a random seed, or it can be entered manually to repeat specific randomizations. e.g. (28222394, myseq1, etc.)
 
 ## Limitations, tips, and notes:
 

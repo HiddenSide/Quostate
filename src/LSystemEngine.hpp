@@ -512,6 +512,40 @@ public:
         return true;
     }
 
+    bool isQueueEmpty() const { return queue.empty(); }
+    RuleKey getLastFiredKey() const { return lastFiredKey; }
+    int getLastFiredFieldIndex() const { return lastFiredFieldIndex; }
+    void setCurrentKey(RuleKey k) { current = k; }
+    void setForcedFieldIndex(int idx) { forcedFieldIndex = idx; }
+    void resetTo(RuleKey k) {
+        current = k;
+        forcedFieldIndex = -1;
+        queue.clear();
+        firedThisStep = false;
+        eorFired = false;
+        eosFired = false;
+        lastRandomGrade = 1;
+        lastRandomDuration = PPQN;
+        lastListGrade = 1;
+        lastListDuration = PPQN;
+        productionCycleIndex.clear();
+        suppressEndSignalsOnce = true;
+    }
+    void resetToField(int fieldIdx, RuleKey k) {
+        current = k;
+        forcedFieldIndex = fieldIdx;
+        queue.clear();
+        firedThisStep = false;
+        eorFired = false;
+        eosFired = false;
+        lastRandomGrade = 1;
+        lastRandomDuration = PPQN;
+        lastListGrade = 1;
+        lastListDuration = PPQN;
+        productionCycleIndex.clear();
+        suppressEndSignalsOnce = true;
+    }
+
     RuleKey getCurrentKey() const { return current; }
 
     bool firedThisStep = false;
@@ -519,6 +553,7 @@ public:
     bool eosFired = false;
     RuleKey lastFiredKey;
     int lastFiredFieldIndex = -1; // the actual field row that fired, or -1 if unknown
+    int forcedFieldIndex = -1;    // if >= 0, forces the next expansion to evaluate this exact row
     int maxExpansions = 200;
     bool suppressEndSignalsOnce = false; // true right after reset(), until the first firing
 
@@ -710,11 +745,35 @@ private:
     ExpandResult expandOnce() {
         const std::vector<Production>* prodList = nullptr;
         RuleKey matchedKey = current;
-        auto it = rules.find(current);
-        if (it != rules.end()) {
-            prodList = &it->second;
-        } else {
-            prodList = findByGrade(current, matchedKey);
+        size_t usedIndex = 0;
+        bool forceMatched = false;
+
+        if (forcedFieldIndex >= 0) {
+            for (auto& kv : keyFieldIndices) {
+                for (size_t p = 0; p < kv.second.size(); p++) {
+                    if (kv.second[p] == forcedFieldIndex) {
+                        matchedKey = kv.first;
+                        auto rIt = rules.find(matchedKey);
+                        if (rIt != rules.end() && p < rIt->second.size()) {
+                            prodList = &rIt->second;
+                            usedIndex = p;
+                            forceMatched = true;
+                            break;
+                        }
+                    }
+                }
+                if (forceMatched) break;
+            }
+            forcedFieldIndex = -1; // consume forced row
+        }
+
+        if (!forceMatched) {
+            auto it = rules.find(current);
+            if (it != rules.end()) {
+                prodList = &it->second;
+            } else {
+                prodList = findByGrade(current, matchedKey);
+            }
         }
 
         if (!prodList) {
@@ -733,8 +792,7 @@ private:
         firedThisStep = true;
         if (!suppressEndSignalsOnce) eorFired = true;
 
-        size_t usedIndex = 0;
-        const Production& prod = pickProduction(matchedKey, *prodList, usedIndex);
+        const Production& prod = forceMatched ? (*prodList)[usedIndex] : pickProduction(matchedKey, *prodList, usedIndex);
         auto fieldsIt = keyFieldIndices.find(matchedKey);
         lastFiredFieldIndex = (fieldsIt != keyFieldIndices.end() && usedIndex < fieldsIt->second.size())
             ? fieldsIt->second[usedIndex] : -1;

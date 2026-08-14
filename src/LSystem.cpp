@@ -5,6 +5,9 @@
 #include "components.hpp"
 #include <mutex>
 #include <cmath>
+#include <random>
+#include <functional>
+#include <algorithm>
 
 using namespace lsys;
 
@@ -13,7 +16,7 @@ using namespace lsys;
 // =======================================================================
 
 struct LSystemModule : Module {
-    enum InputIds { CLOCK_INPUT, RESET_INPUT, RUN_INPUT, NUM_INPUTS };
+    enum InputIds { CLOCK_INPUT, RESET_INPUT, RUN_INPUT, EVAL_INPUT, NUM_INPUTS };
     enum OutputIds { PITCH_OUTPUT, GATE_OUTPUT, EOR_OUTPUT, RULE_OUTPUT, NUM_OUTPUTS };
     enum ParamIds { RUN_PARAM, RESET_PARAM, NUM_PARAMS };
     enum LightIds { RUN_LIGHT, NUM_LIGHTS };
@@ -22,7 +25,26 @@ struct LSystemModule : Module {
     static constexpr int MAX_CHANNELS = 6;
     // Global tunables for the two text-field character caps (per user testing).
     static constexpr int RULE_FIELD_MAX_CHARS = 50;
-    static constexpr int LIST_FIELD_MAX_CHARS = 18;
+    static constexpr int LIST_FIELD_MAX_CHARS = 24;
+
+    enum GenStyle {
+        STYLE_MELODIC = 0,
+        STYLE_ACID_TECHNO,
+        STYLE_AMBIENT,
+        STYLE_COMPLEX_CHAOS,
+        NUM_GEN_STYLES
+    };
+    int genStyle = STYLE_MELODIC;
+
+    enum EvalMode {
+        EVAL_RULE_SELECT = 0, // CV 0-10V: selects target rule (queued at EOR, instant with Reset)
+        EVAL_HOLD_GATE,       // Gate (>2V): loops/holds current rule while high
+        EVAL_STEP_TRIGGER,    // Trigger: advances/evaluates next rule only when trigger arrives at EOR
+        NUM_EVAL_MODES
+    };
+    EvalMode evalMode = EVAL_RULE_SELECT;
+    dsp::SchmittTrigger evalInputTrigger[MAX_CHANNELS];
+    bool evalTriggered[MAX_CHANNELS] = {};
 
     std::string fieldText[NUM_FIELDS];
     bool fieldError[NUM_FIELDS] = {};
@@ -101,6 +123,7 @@ struct LSystemModule : Module {
         configInput(CLOCK_INPUT, "Clock (48 PPQN)");
         configInput(RESET_INPUT, "Reset");
         configInput(RUN_INPUT, "Run Toggle (trigger)");
+        configInput(EVAL_INPUT, "Eval");
         configOutput(PITCH_OUTPUT, "V/Oct");
         configOutput(GATE_OUTPUT, "Gate");
         configOutput(EOR_OUTPUT, "End of Rule Trigger");
@@ -192,6 +215,362 @@ struct LSystemModule : Module {
             engines[ch].setFallback(fallback);
             engines[ch].setGradeRange(gradeMin, gradeMax);
         }
+    }
+
+    // ---- Rule randomization -------------------------------------------
+    // Deterministic given the same seed text: uses its OWN rng here, entirely
+    // separate from each LSystemEngine's runtime rng (which keeps resolving
+    // 'r'/'k' genuinely randomly during playback, completely unaffected).
+
+    std::string seedText; // shown/edited in the context menu; numeric or any string (hashed)
+
+    struct DurationChoice { int ticks; const char* text; };
+
+    struct GenProfile {
+        int minSteps = 2;
+        int maxSteps = 3;
+        float rProb = 0.35f;
+        float kProb = 0.25f;
+        float lProb = 0.15f;
+        float listProb = 0.25f;
+        float restProb = 0.12f;
+        float glideProb = 0.20f;
+        float repeatProb = 0.30f;
+        float branchExitProb = 0.35f;
+        std::vector<DurationChoice> durations;
+    };
+
+    static GenProfile getProfileForStyle(GenStyle style) {
+        GenProfile p;
+        switch (style) {
+            case STYLE_ACID_TECHNO:
+                p.minSteps = 2;
+                p.maxSteps = 3;
+                p.rProb = 0.35f;
+                p.kProb = 0.30f;
+                p.lProb = 0.15f;
+                p.listProb = 0.20f;
+                p.restProb = 0.18f;
+                p.glideProb = 0.35f;
+                p.repeatProb = 0.45f;
+                p.branchExitProb = 0.30f;
+                p.durations = {
+                    {PPQN / 4, "1/4"}, {PPQN / 8, "1/8"}, {PPQN / 2, "1/2"}, {PPQN / 3, "1/3"}
+                };
+                break;
+            case STYLE_AMBIENT:
+                p.minSteps = 1;
+                p.maxSteps = 2;
+                p.rProb = 0.40f;
+                p.kProb = 0.25f;
+                p.lProb = 0.20f;
+                p.listProb = 0.35f;
+                p.restProb = 0.08f;
+                p.glideProb = 0.30f;
+                p.repeatProb = 0.35f;
+                p.branchExitProb = 0.40f;
+                p.durations = {
+                    {PPQN, "1"}, {PPQN * 2, "2"}, {PPQN / 2, "1/2"}, {(PPQN * 3) / 4, "3/4"}
+                };
+                break;
+            case STYLE_COMPLEX_CHAOS:
+                p.minSteps = 2;
+                p.maxSteps = 3;
+                p.rProb = 0.40f;
+                p.kProb = 0.25f;
+                p.lProb = 0.20f;
+                p.listProb = 0.40f;
+                p.restProb = 0.15f;
+                p.glideProb = 0.25f;
+                p.repeatProb = 0.35f;
+                p.branchExitProb = 0.50f;
+                p.durations = {
+                    {PPQN / 4, "1/4"}, {PPQN / 2, "1/2"}, {PPQN, "1"}, {(PPQN * 3) / 4, "3/4"}, {PPQN / 3, "1/3"}
+                };
+                break;
+            case STYLE_MELODIC:
+            default:
+                p.minSteps = 2;
+                p.maxSteps = 3;
+                p.rProb = 0.35f;
+                p.kProb = 0.25f;
+                p.lProb = 0.15f;
+                p.listProb = 0.25f;
+                p.restProb = 0.12f;
+                p.glideProb = 0.20f;
+                p.repeatProb = 0.30f;
+                p.branchExitProb = 0.35f;
+                p.durations = {
+                    {PPQN / 4, "1/4"}, {PPQN / 2, "1/2"}, {PPQN, "1"}, {(PPQN * 3) / 4, "3/4"}
+                };
+                break;
+        }
+        return p;
+    }
+
+    uint32_t resolveSeed() {
+        if (seedText.empty()) {
+            std::random_device rd;
+            uint32_t s = rd();
+            seedText = std::to_string(s);
+            return s;
+        }
+        try {
+            unsigned long v = std::stoul(seedText);
+            return (uint32_t)(v & 0xFFFFFFFFu);
+        } catch (...) {
+            // Non-numeric seed text (e.g. a word): hash it into a seed
+            // instead of rejecting it, so any memorable string works too.
+            return (uint32_t)(std::hash<std::string>{}(seedText) & 0xFFFFFFFFu);
+        }
+    }
+
+    // Generates compact, weighted candidate pools for 'r' degrees and durations,
+    // tailored to the active musical style and strictly capped to LIST_FIELD_MAX_CHARS.
+    void randomizePools(std::mt19937& rng, GenStyle style) {
+        // 1. Degree Pool
+        std::vector<std::pair<int, int>> degCandidates;
+        switch (style) {
+            case STYLE_ACID_TECHNO:
+                degCandidates = {{1, 5}, {-3, 2}, {8, 3}, {3, 2}, {5, 2}, {-1, 1}};
+                break;
+            case STYLE_AMBIENT:
+                degCandidates = {{1, 4}, {3, 3}, {5, 3}, {7, 2}, {8, 2}, {10, 1}};
+                break;
+            case STYLE_COMPLEX_CHAOS:
+                degCandidates = {{1, 4}, {2, 2}, {3, 3}, {5, 3}, {7, 2}, {-2, 1}};
+                break;
+            case STYLE_MELODIC:
+            default:
+                degCandidates = {{1, 4}, {3, 3}, {5, 3}, {7, 2}, {8, 2}, {-2, 1}};
+                break;
+        }
+        std::shuffle(degCandidates.begin(), degCandidates.end(), rng);
+        std::string dStr;
+        for (size_t i = 0; i < degCandidates.size(); i++) {
+            int g = std::max(gradeMin, std::min(gradeMax, degCandidates[i].first));
+            int w = degCandidates[i].second;
+            std::string item = std::to_string(g) + (w > 1 ? ":" + std::to_string(w) : "");
+            if (!dStr.empty() && dStr.size() + 1 + item.size() > (size_t)LIST_FIELD_MAX_CHARS) break;
+            if (!dStr.empty()) dStr += ",";
+            dStr += item;
+        }
+        setRandomGradeListText(dStr);
+
+        // 2. Duration Pool
+        std::vector<std::pair<std::string, int>> durCandidates;
+        switch (style) {
+            case STYLE_ACID_TECHNO:
+                durCandidates = {{"1/4", 5}, {"1/8", 3}, {"1/2", 2}, {"1/3", 1}};
+                break;
+            case STYLE_AMBIENT:
+                durCandidates = {{"1", 4}, {"2", 2}, {"1/2", 3}, {"3/4", 1}};
+                break;
+            case STYLE_COMPLEX_CHAOS:
+                durCandidates = {{"1/4", 4}, {"1/2", 3}, {"1/3", 2}, {"1", 1}};
+                break;
+            case STYLE_MELODIC:
+            default:
+                durCandidates = {{"1/4", 4}, {"1/2", 3}, {"1", 2}, {"3/4", 1}};
+                break;
+        }
+        std::shuffle(durCandidates.begin(), durCandidates.end(), rng);
+        std::string tStr;
+        for (size_t i = 0; i < durCandidates.size(); i++) {
+            std::string item = durCandidates[i].first + (durCandidates[i].second > 1 ? ":" + std::to_string(durCandidates[i].second) : "");
+            if (!tStr.empty() && tStr.size() + 1 + item.size() > (size_t)LIST_FIELD_MAX_CHARS) break;
+            if (!tStr.empty()) tStr += ",";
+            tStr += item;
+        }
+        setRandomDurationListText(tStr);
+    }
+
+    // Fills fieldText[] with a freshly generated, self-consistent, and musically
+    // coherent rule set utilizing the full DSL syntax (r, k, l, ^, s, <>, *N, +N).
+    // Topology is built as an irreducible directed graph (Hamiltonian cycle backbone
+    // + probabilistic shortcut exits) guaranteeing ergodicity with no closed sub-loops.
+    void generateRandomRules(std::mt19937& rng, GenStyle style) {
+        randomizePools(rng, style);
+        GenProfile prof = getProfileForStyle(style);
+
+        // Pick 7 distinct initiators rooted in the musical scale
+        std::vector<int> degreeBase = {1, 3, 5, 2, 4, 7, 8, -2, 6, -1};
+        std::vector<int> pickedGrades;
+        pickedGrades.push_back(1); // Rule 1 is always tonic degree 1
+        std::vector<int> poolForRest(degreeBase.begin() + 1, degreeBase.end());
+        std::shuffle(poolForRest.begin(), poolForRest.end(), rng);
+        for (int i = 0; i < NUM_FIELDS - 1; i++) {
+            int g = std::max(gradeMin, std::min(gradeMax, poolForRest[i]));
+            pickedGrades.push_back(g);
+        }
+
+        std::uniform_int_distribution<int> durDist(0, (int)prof.durations.size() - 1);
+        struct InitiatorDef { int grade; int ticks; std::string durText; };
+        std::vector<InitiatorDef> initiators(NUM_FIELDS);
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            int di = (i == 0) ? (prof.durations.size() > 1 ? 1 : 0) : durDist(rng);
+            initiators[i] = { pickedGrades[i], prof.durations[di].ticks, prof.durations[di].text };
+        }
+
+        // Directed graph: Hamiltonian cycle backbone
+        std::vector<int> order(NUM_FIELDS);
+        for (int i = 0; i < NUM_FIELDS; i++) order[i] = i;
+        std::shuffle(order.begin() + 1, order.end(), rng);
+
+        std::vector<int> cycleNext(NUM_FIELDS);
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            int cur = order[i];
+            int nxt = order[(i + 1) % NUM_FIELDS];
+            cycleNext[cur] = nxt;
+        }
+
+        std::uniform_real_distribution<float> prob(0.f, 1.f);
+        std::uniform_int_distribution<int> stepsDist(prof.minSteps, prof.maxSteps);
+        std::uniform_int_distribution<int> offsetDist(1, 2);
+
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            bool valid = false;
+            int attempts = 0;
+            std::string finalRule;
+
+            while (!valid && attempts < 20) {
+                attempts++;
+                std::string line = std::to_string(initiators[i].grade) + "," + initiators[i].durText + " -> ";
+
+                int numSteps = stepsDist(rng);
+                bool rUsed = false;
+                bool listUsed = false;
+                bool lastWasRest = false;
+
+                std::vector<std::string> stepTokens;
+                std::vector<bool> glideFlags;
+
+                for (int s = 0; s < numSteps; s++) {
+                    float pG = prob(rng);
+                    float pD = prob(rng);
+                    std::string gStr;
+                    std::string dStr;
+
+                    // Grade generation
+                    if (pG < prof.restProb && !lastWasRest && s > 0) {
+                        gStr = "s";
+                        lastWasRest = true;
+                    } else if (pG < prof.restProb + prof.rProb) {
+                        gStr = "r";
+                        rUsed = true;
+                        lastWasRest = false;
+                    } else if (rUsed && pG < prof.restProb + prof.rProb + prof.kProb) {
+                        if (prob(rng) < 0.4f) {
+                            int off = offsetDist(rng);
+                            gStr = "k+" + std::to_string(off);
+                        } else if (prob(rng) < 0.2f) {
+                            int off = offsetDist(rng);
+                            gStr = "k-" + std::to_string(off);
+                        } else {
+                            gStr = "k";
+                        }
+                        lastWasRest = false;
+                    } else if (listUsed && pG < prof.restProb + prof.rProb + prof.kProb + prof.lProb) {
+                        gStr = "l";
+                        lastWasRest = false;
+                    } else if (pG < prof.restProb + prof.rProb + prof.kProb + prof.lProb + prof.listProb) {
+                        int c1 = pickedGrades[rng() % pickedGrades.size()];
+                        int c2 = pickedGrades[rng() % pickedGrades.size()];
+                        if (c1 == c2) c2 = (c1 == 1 ? 5 : 1);
+                        gStr = "<" + std::to_string(c1) + "," + std::to_string(c2) + ">";
+                        listUsed = true;
+                        lastWasRest = false;
+                    } else {
+                        int delta = (int)(rng() % 5) - 2; // -2 to +2
+                        int val = std::max(gradeMin, std::min(gradeMax, initiators[i].grade + delta));
+                        gStr = std::to_string(val);
+                        lastWasRest = false;
+                    }
+
+                    // Duration generation
+                    if (lastWasRest) {
+                        dStr = prof.durations[durDist(rng)].text;
+                    } else if (pD < prof.rProb * 0.5f) {
+                        dStr = "r";
+                    } else if (rUsed && pD < (prof.rProb * 0.5f) + prof.kProb * 0.5f) {
+                        dStr = "k";
+                    } else if (pD < 0.25f && prof.durations.size() >= 2) {
+                        int di1 = rng() % prof.durations.size();
+                        int di2 = (di1 + 1) % prof.durations.size();
+                        dStr = "<" + std::string(prof.durations[di1].text) + "," + prof.durations[di2].text + ">";
+                    } else {
+                        dStr = prof.durations[durDist(rng)].text;
+                    }
+
+                    stepTokens.push_back(gStr + "," + dStr);
+                    bool canGlide = (!lastWasRest && s < numSteps - 1 && prob(rng) < prof.glideProb);
+                    glideFlags.push_back(canGlide);
+                }
+
+                // Assemble steps
+                for (size_t s = 0; s < stepTokens.size(); s++) {
+                    line += stepTokens[s];
+                    if (s + 1 < stepTokens.size()) {
+                        line += (glideFlags[s] ? "^" : " ");
+                    }
+                }
+
+                // Exit Routing Step
+                int targetMain = cycleNext[i];
+                std::string exitStep;
+
+                if (prob(rng) < prof.branchExitProb && i != targetMain) {
+                    int targetBranch = 0; // Shortcut back to tonic or another theme
+                    if (targetBranch == targetMain) targetBranch = order[(i + 3) % NUM_FIELDS];
+                    int gA = initiators[targetMain].grade;
+                    int gB = initiators[targetBranch].grade;
+                    if (gA != gB) {
+                        exitStep = "<" + std::to_string(gA) + ":3," + std::to_string(gB) + ":1>," + initiators[targetMain].durText;
+                    } else {
+                        exitStep = std::to_string(gA) + "," + initiators[targetMain].durText;
+                    }
+                } else {
+                    exitStep = std::to_string(initiators[targetMain].grade) + "," + initiators[targetMain].durText;
+                }
+
+                if (!stepTokens.empty()) {
+                    line += (glideFlags.empty() || !glideFlags.back() ? " " : "^");
+                }
+                line += exitStep;
+
+                // Repetition *N
+                if (prob(rng) < prof.repeatProb) {
+                    int reps = (style == STYLE_AMBIENT || style == STYLE_ACID_TECHNO) ? (prob(rng) < 0.5f ? 4 : 2) : 2;
+                    line += " *" + std::to_string(reps);
+                }
+
+                // Check length & syntax validity
+                if (line.size() <= (size_t)RULE_FIELD_MAX_CHARS) {
+                    RuleTable testTable;
+                    std::string err;
+                    if (parseRuleLine(line, testTable, err)) {
+                        finalRule = line;
+                        valid = true;
+                    }
+                }
+            }
+
+            if (!valid) {
+                int targetMain = cycleNext[i];
+                finalRule = std::to_string(initiators[i].grade) + "," + initiators[i].durText + " -> " +
+                            std::to_string(initiators[targetMain].grade) + "," + initiators[targetMain].durText;
+            }
+
+            fieldText[i] = finalRule;
+        }
+    }
+
+    void randomizeRules() {
+        uint32_t seed = resolveSeed();
+        std::mt19937 genRng(seed);
+        generateRandomRules(genRng, (GenStyle)genStyle);
+        recompileAll();
+        resetAllEngines();
     }
 
     // ---- Optional 'r' candidate lists -------------------------------------
@@ -307,6 +686,7 @@ struct LSystemModule : Module {
             retrigSamplesLeft[ch] = 0;
             autoResetPulseCount[ch] = 0;
             gliding[ch] = false;
+            evalTriggered[ch] = false;
         }
         activeField = -1;
     }
@@ -342,6 +722,43 @@ struct LSystemModule : Module {
         bool got;
         {
             std::lock_guard<std::mutex> lock(engineMutex);
+            if (engines[ch].isQueueEmpty() && inputs[EVAL_INPUT].isConnected()) {
+                int evalChans = inputs[EVAL_INPUT].getChannels();
+                float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
+                switch (evalMode) {
+                    case EVAL_RULE_SELECT: {
+                        // Voltajes < -1V se tratan como "ignorar Eval": el L-System
+                        // continua su evaluacion natural, util con fuentes CV bipolares.
+                        if (evalV >= -1.0f) {
+                            int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
+                            if (fieldKeyCommittedValid[targetRow]) {
+                                engines[ch].setCurrentKey(fieldKeyCommitted[targetRow]);
+                                engines[ch].setForcedFieldIndex(targetRow);
+                            }
+                        }
+                        break;
+                    }
+                    case EVAL_HOLD_GATE: {
+                        if (evalV > 2.0f) {
+                            engines[ch].setCurrentKey(engines[ch].getLastFiredKey());
+                            engines[ch].setForcedFieldIndex(engines[ch].getLastFiredFieldIndex());
+                        }
+                        break;
+                    }
+                    case EVAL_STEP_TRIGGER: {
+                        if (evalTriggered[ch]) {
+                            evalTriggered[ch] = false;
+                        } else {
+                            engines[ch].setCurrentKey(engines[ch].getLastFiredKey());
+                            engines[ch].setForcedFieldIndex(engines[ch].getLastFiredFieldIndex());
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+
             got = engines[ch].nextEvent(ev);
             if (got && engines[ch].firedThisStep) {
                 if (ch == 0) activeField = engines[ch].lastFiredFieldIndex;
@@ -414,9 +831,52 @@ struct LSystemModule : Module {
         }
         wasRunning = isRunning;
 
-        if (resetTrigger.process(inputs[RESET_INPUT].getVoltage()) ||
-            resetButtonTrigger.process(params[RESET_PARAM].getValue())) {
-            resetAllEngines();
+        if (inputs[EVAL_INPUT].isConnected()) {
+            int evalChans = inputs[EVAL_INPUT].getChannels();
+            for (int ch = 0; ch < numChannels; ch++) {
+                float v = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
+                if (evalInputTrigger[ch].process(v)) {
+                    evalTriggered[ch] = true;
+                }
+            }
+        }
+
+        bool resetBtn = resetButtonTrigger.process(params[RESET_PARAM].getValue());
+        bool resetIn = resetTrigger.process(inputs[RESET_INPUT].getVoltage());
+        if (resetBtn || resetIn) {
+            if (resetIn && !resetBtn && inputs[EVAL_INPUT].isConnected() && evalMode == EVAL_RULE_SELECT) {
+                // If ch0 voltage is below -1V, treat Reset+Eval as a plain reset.
+                int evalChans = inputs[EVAL_INPUT].getChannels();
+                float evalV0 = inputs[EVAL_INPUT].getVoltage(0 < evalChans ? 0 : 0);
+                if (evalV0 >= -1.0f) {
+                    std::lock_guard<std::mutex> lock(engineMutex);
+                    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                        float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
+                        // Per-channel: if a polyphonic channel is negative, reset it normally.
+                        if (evalV < -1.0f) {
+                            engines[ch].resetTo(fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                            ticksRemaining[ch] = 0; gateHigh[ch] = false;
+                            retrigSamplesLeft[ch] = 0; autoResetPulseCount[ch] = 0;
+                            gliding[ch] = false; evalTriggered[ch] = false;
+                            continue;
+                        }
+                        int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
+                        RuleKey targetKey = fieldKeyCommittedValid[targetRow] ? fieldKeyCommitted[targetRow] : (fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                        engines[ch].resetToField(targetRow, targetKey);
+                        ticksRemaining[ch] = 0;
+                        gateHigh[ch] = false;
+                        retrigSamplesLeft[ch] = 0;
+                        autoResetPulseCount[ch] = 0;
+                        gliding[ch] = false;
+                        evalTriggered[ch] = false;
+                        if (ch == 0) activeField = targetRow;
+                    }
+                } else {
+                    resetAllEngines();
+                }
+            } else {
+                resetAllEngines();
+            }
         }
 
         if (isRunning && inputs[CLOCK_INPUT].isConnected() &&
@@ -462,6 +922,9 @@ struct LSystemModule : Module {
         json_object_set_new(rootJ, "running", json_boolean(running));
         json_object_set_new(rootJ, "rGradeList", json_string(rGradeListText.c_str()));
         json_object_set_new(rootJ, "rDurationList", json_string(rDurationListText.c_str()));
+        json_object_set_new(rootJ, "seedText", json_string(seedText.c_str()));
+        json_object_set_new(rootJ, "genStyle", json_integer(genStyle));
+        json_object_set_new(rootJ, "evalMode", json_integer((int)evalMode));
         return rootJ;
     }
 
@@ -496,6 +959,12 @@ struct LSystemModule : Module {
         if (rgJ) setRandomGradeListText(json_string_value(rgJ));
         json_t* rdJ = json_object_get(rootJ, "rDurationList");
         if (rdJ) setRandomDurationListText(json_string_value(rdJ));
+        json_t* seedJ = json_object_get(rootJ, "seedText");
+        if (seedJ) seedText = json_string_value(seedJ);
+        json_t* gsJ = json_object_get(rootJ, "genStyle");
+        if (gsJ) genStyle = std::max(0, std::min((int)NUM_GEN_STYLES - 1, (int)json_integer_value(gsJ)));
+        json_t* emJ = json_object_get(rootJ, "evalMode");
+        if (emJ) evalMode = (EvalMode)std::max(0, std::min((int)NUM_EVAL_MODES - 1, (int)json_integer_value(emJ)));
         recompileAll();
         resetAllEngines();
     }
@@ -508,10 +977,14 @@ struct LSystemModule : Module {
             fieldError[i] = false;
             fieldErrorMsg[i].clear();
         }
+        for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+            evalTriggered[ch] = false;
+        }
         rGradeListText.clear();
         rDurationListText.clear();
         rGradeListError = false;
         rDurationListError = false;
+        seedText.clear();
         recompileAll();
         resetAllEngines();
     }
@@ -808,6 +1281,62 @@ struct ListTextField : ui::TextField {
     }
 };
 
+// Seed entry field for "Randomize Rules", embedded directly in the context
+// menu (no panel space needed). Accepts any text: a plain number is used
+// directly as the RNG seed; anything else is hashed into one, so a
+// memorable word works too. Left empty, Randomize Rules generates a fresh
+// random seed and writes it back here, so the result can be reproduced later.
+struct SeedTextField : ui::TextField {
+    LSystemModule* module = nullptr;
+    int lastTextLen = -1;
+
+    SeedTextField() { box.size = Vec(140.f, 20.f); }
+
+    size_t maxChars() const { return 24; }
+
+    void step() override {
+        TextField::step();
+        if (lastTextLen < 0) {
+            lastTextLen = (int)text.size();
+        } else if ((int)text.size() > lastTextLen) {
+            float maxWidthPx = box.size.x - QUO_FIELD_TEXT_X - 3.f;
+            size_t before = text.size();
+            quoTrimToFit(text, maxWidthPx, maxChars());
+            if (text.size() != before) {
+                cursor = std::min(cursor, (int)text.size());
+                selection = std::min(selection, (int)text.size());
+            }
+        }
+        lastTextLen = (int)text.size();
+
+        bool focused = (APP->event && APP->event->selectedWidget == this);
+        if (module && !focused && text != module->seedText) {
+            text = module->seedText;
+            cursor = std::min(cursor, (int)text.size());
+            selection = std::min(selection, (int)text.size());
+            lastTextLen = (int)text.size();
+        }
+    }
+
+    int getTextPosition(Vec mousePos) override {
+        return quoFindCursorIndex(APP->window->vg, text, mousePos.x);
+    }
+
+    void onAction(const event::Action& e) override {
+        TextField::onAction(e);
+        if (module) module->seedText = text;
+    }
+    void onDeselect(const event::Deselect& e) override {
+        TextField::onDeselect(e);
+        if (module) module->seedText = text;
+    }
+
+    void draw(const DrawArgs& args) override {
+        bool focused = (APP->event && APP->event->selectedWidget == this);
+        drawStyledTextField(args, box.size, text, cursor, selection, focused);
+    }
+};
+
 
 // =======================================================================
 // MODULE WIDGET
@@ -910,8 +1439,9 @@ struct LSystemModuleWidget : ModuleWidget {
         addInput(createInputCentered<QuoJack>(mm2px(Vec(9.173f, 110.839f)), module, LSystemModule::CLOCK_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(21.387f, 110.839f)), module, LSystemModule::RESET_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(33.576f, 110.839f)), module, LSystemModule::RUN_INPUT));
-        addOutput(createOutputCentered<QuoJack>(mm2px(Vec(45.760f, 110.839f)), module, LSystemModule::EOR_OUTPUT));
-        addOutput(createOutputCentered<QuoJack>(mm2px(Vec(57.942f, 110.839f)), module, LSystemModule::RULE_OUTPUT));
+        addInput(createInputCentered<QuoJack>(mm2px(Vec(45.681f, 110.839f)), module, LSystemModule::EVAL_INPUT));
+        addOutput(createOutputCentered<QuoJack>(mm2px(Vec(70.006f, 110.839f)), module, LSystemModule::EOR_OUTPUT));
+        addOutput(createOutputCentered<QuoJack>(mm2px(Vec(57.913f, 110.839f)), module, LSystemModule::RULE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(85.283f, 110.815f)), module, LSystemModule::GATE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(97.512f, 110.815f)), module, LSystemModule::PITCH_OUTPUT));
         // Port/button labels ("Clk", "Rst", "Run", "V/Oct", "Gate", "EOR", "EOS")
@@ -946,6 +1476,19 @@ struct LSystemModuleWidget : ModuleWidget {
                 menu->addChild(createCheckMenuItem(o.name, "",
                     [=]() { return m->fallback == o.mode; },
                     [=]() { m->setFallback(o.mode); }));
+            }
+        }));
+
+        menu->addChild(createSubmenuItem("Eval input mode", "", [=](Menu* menu) {
+            static const struct { const char* name; LSystemModule::EvalMode mode; } modes[] = {
+                {"Rule select (0-10V CV)", LSystemModule::EVAL_RULE_SELECT},
+                {"Loop / Hold rule (Gate)", LSystemModule::EVAL_HOLD_GATE},
+                {"Advance on trigger (Trigger)", LSystemModule::EVAL_STEP_TRIGGER},
+            };
+            for (auto& mde : modes) {
+                menu->addChild(createCheckMenuItem(mde.name, "",
+                    [=]() { return m->evalMode == mde.mode; },
+                    [=]() { m->evalMode = mde.mode; }));
             }
         }));
 
@@ -990,6 +1533,32 @@ struct LSystemModuleWidget : ModuleWidget {
                     [=]() { return m->gradeMin == p[0] && m->gradeMax == p[1]; },
                     [=]() { m->setGradeRange(p[0], p[1]); }));
             }
+        }));
+
+        menu->addChild(new MenuSeparator);
+        menu->addChild(createMenuLabel("Randomize rules"));
+
+        menu->addChild(createSubmenuItem("Randomize rules style", "", [=](Menu* menu) {
+            static const struct { const char* name; LSystemModule::GenStyle style; } styles[] = {
+                {"Melodic (Song Form)", LSystemModule::STYLE_MELODIC},
+                {"Acid / Techno / Polyrhythmic", LSystemModule::STYLE_ACID_TECHNO},
+                {"Ambient / Evolving", LSystemModule::STYLE_AMBIENT},
+                {"Complex L-System", LSystemModule::STYLE_COMPLEX_CHAOS},
+            };
+            for (auto& s : styles) {
+                menu->addChild(createCheckMenuItem(s.name, "",
+                    [=]() { return m->genStyle == (int)s.style; },
+                    [=]() { m->genStyle = (int)s.style; }));
+            }
+        }));
+
+        SeedTextField* seedField = new SeedTextField;
+        seedField->module = m;
+        seedField->text = m->seedText;
+        menu->addChild(seedField);
+
+        menu->addChild(createMenuItem("Randomize Rules", "", [=]() {
+            m->randomizeRules();
         }));
     }
 };

@@ -103,11 +103,17 @@ The Rule output sends a stepped voltage from 0 to 10V according to which rule is
 
 Good moment to remember that every output of the module is independent per channel in polyphonic mode.
 
-## Run and Reset buttons, Run Toggle and Reset inputs:
+## Run and Reset buttons, Run Toggle, Reset, and Eval inputs:
 The Run button stops or starts the module's sequence, shown by a light on that button.
 The Run Toggle input flips the Run button's state every time it receives a trigger.
-The Reset button, and its corresponding input, restart the sequence of every channel back to the first rule.
+The Reset button, and its corresponding input, restart the sequence of every channel back to the first rule (or immediately to the rule selected on `Eval` if connected in Rule Select mode).
 You can specify from the context menu whether a reset is applied every time the sequence is started with the Run button or the Run Toggle input.
+
+### Eval Input:
+The `Eval` input allows external control over rule sequencing and transitions. Its behavior is configured from the context menu (`Eval input mode`):
+- **Rule select (0-10V CV)**: (Default) Accepts a 0 to 10V control voltage mapped 1:1 with the `Rule` output ($0\text{V} = \text{Rule 1} \dots 10\text{V} = \text{Rule 7}$). During normal playback, transitions are queued: when the currently active rule finishes (EOR), it jumps to the selected target rule instead of evaluating its normal exit degree. If a trigger arrives at the `Reset` input while `Eval` is connected, it performs an immediate hard jump directly to step 1 of the target rule.
+- **Loop / Hold rule (Gate)**: While a high gate ($>2\text{V}$) is held at the `Eval` input, the currently active rule repeats in an infinite loop. When the gate goes low ($0\text{V}$), normal L-system evaluation resumes at the end of the rule.
+- **Advance on trigger (Trigger)**: The module loops the active rule until a trigger pulse is received at `Eval`, at which point the next rule transition is evaluated.
 
 ## Durations: allowed values and limits.
 Time unit: the module works internally in ticks, where 48 ticks = "1" (one beat/quarter note, since it's designed for 48 PPQN at the clock). Everything you write as a duration is converted to ticks on that basis.
@@ -126,6 +132,8 @@ These same format rules and limits apply exactly the same way to the values ente
 
 **If a note has no rule...** Selects between jumping to the first rule (default) or jumping to a random one when the last degree of a rule has no targets in the initiators.
 
+**Eval input mode**: Selects how the `Eval` input behaves: `Rule select (0-10V CV)` (queued or instant jump), `Loop / Hold rule (Gate)` (gate repeat), or `Advance on trigger (Trigger)` (stepped transitions).
+
 **Autoreset after steps**: Options to immediately reset the module after a certain number of steps based on the Clock input. Selectable options: Off (default), 8, 16, 32, or 64 steps.
 
 **Scale**: Allows selecting the scale to which the rule degrees will be quantized. Natural major scale by default.
@@ -133,6 +141,12 @@ These same format rules and limits apply exactly the same way to the values ente
 **Root note**: Allows selecting the root note or tonic of the scale. C by default.
 
 **Random degree range(r)**: Allows selecting from various predefined limits within which `r` will pick its value if the [Random pool for r(Degrees)] input is empty. Also applies limits to the `'+'` and `-` operators. `-8 to 16` by default.
+
+**Randomize rules style**: Selects the generative profile used when generating rules with "Randomize Rules":
+- *Melodic (Song Form)*: Structured phrases, balanced ratios, harmonic anchoring.
+- *Acid / Techno / Polyrhythmic*: Fast pulses (`1/4`, `1/8`, `1/3`), percussive rests `s`, glides `^`, and evolutionary `*4` transpositions (`k+1`, `k-1`).
+- *Ambient / Evolving*: Floating durations, modal spread, glides and `*2`/`*4` expansions.
+- *Complex L-System*: Full DSL exploitation with `<...>` weighted lists, memories `k`/`l`, and dynamic branch routing.
 
 ## Limitations, tips, and notes:
 

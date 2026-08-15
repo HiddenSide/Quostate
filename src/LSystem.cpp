@@ -568,10 +568,208 @@ struct LSystemModule : Module {
     void randomizeRules() {
         uint32_t seed = resolveSeed();
         std::mt19937 genRng(seed);
-        generateRandomRules(genRng, (GenStyle)genStyle);
+
+        if (genStyle == STYLE_ACID_TECHNO) {
+            generateAcidTechnoRules(genRng);
+        } else {
+            generateRandomRules(genRng, (GenStyle)genStyle);
+        }
+
         recompileAll();
         resetAllEngines();
     }
+
+
+    // ---------------------------------------------------------------------
+    // Acid / Techno oriented rule generator.
+    // Goal: groove, repetition, hypnotic loops, fewer rule changes,
+    // fewer random durations, and optional '=T' loop completion.
+    // ---------------------------------------------------------------------
+    void generateAcidTechnoRules(std::mt19937& rng) {
+        // Acid-friendly r-pools.
+        // Mostly tonic / fifth / third / octave material.
+        setRandomGradeListText("1:6,5:3,3:2,8:2");
+
+        // Very constrained duration pool.
+        // Mostly 1/4, some 1/2.
+        setRandomDurationListText("1/4:8,1/2:2");
+
+        // Detect whether the '=T' fill syntax is available.
+        // If not, fall back to ordinary fixed exit durations.
+        bool canUseFill = false;
+        {
+            RuleTable testTable;
+            std::string err;
+            canUseFill = parseRuleLine("1,1 -> 1,=1", testTable, err);
+        }
+
+        auto clampGrade = [&](int g) {
+            return std::max(gradeMin, std::min(gradeMax, g));
+        };
+
+        // Pick 7 mostly distinct acid-ish degrees.
+        std::vector<int> grades;
+        std::vector<int> preferred = {
+            1, 5, 3, 8, 2, 7, -1, 4, 6, -2, 9, 11, 10, 12
+        };
+
+        for (int g : preferred) {
+            int cg = clampGrade(g);
+            if (std::find(grades.begin(), grades.end(), cg) == grades.end()) {
+                grades.push_back(cg);
+            }
+            if ((int)grades.size() == NUM_FIELDS) break;
+        }
+
+        // If the user selected a very small grade range, fill remaining slots.
+        for (int g = gradeMin; g <= gradeMax && (int)grades.size() < NUM_FIELDS; g++) {
+            if (std::find(grades.begin(), grades.end(), g) == grades.end()) {
+                grades.push_back(g);
+            }
+        }
+
+        while ((int)grades.size() < NUM_FIELDS) {
+            grades.push_back(grades.empty() ? 1 : grades.back());
+        }
+
+        // Rule transition backbone, used when a rule does not self-loop.
+        std::vector<int> order(NUM_FIELDS);
+        for (int i = 0; i < NUM_FIELDS; i++) order[i] = i;
+        std::shuffle(order.begin() + 1, order.end(), rng);
+
+        std::vector<int> cycleNext(NUM_FIELDS);
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            cycleNext[order[i]] = order[(i + 1) % NUM_FIELDS];
+        }
+
+        // Short hypnotic patterns.
+        // H = home degree of this rule.
+        // Each pattern tries to use at most one 'r'.
+        static const std::vector<std::vector<std::string>> patterns1 = {
+            {"H", "H"},
+            {"H", "H", "H"},
+            {"H", "r"},
+            {"H", "r", "k"},
+            {"H", "r", "H"},
+            {"H", "s", "r"}
+        };
+
+        static const std::vector<std::vector<std::string>> patterns2 = {
+            {"H", "H", "H", "H"},
+            {"H", "H", "r", "k"},
+            {"H", "r", "k", "H"},
+            {"H", "r", "k+1", "k"},
+            {"H", "s", "r", "k"}
+        };
+
+        std::uniform_real_distribution<float> prob(0.f, 1.f);
+        std::uniform_int_distribution<size_t> pick1(0, patterns1.size() - 1);
+        std::uniform_int_distribution<size_t> pick2(0, patterns2.size() - 1);
+
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            int home = grades[i];
+            std::string homeStr = std::to_string(home);
+
+            // Most acid rules feel better locked to 1 beat.
+            // Some 2-beat rules add phrase variation.
+            std::string fillTarget = (prob(rng) < 0.70f) ? "1" : "2";
+
+            // High chance of self-loop: the rule keeps looping itself.
+            // Rule 1, the tonic rule, should be especially sticky.
+            bool selfLoop = prob(rng) < ((i == 0) ? 0.80f : 0.60f);
+
+            int targetRule = selfLoop ? i : cycleNext[i];
+            int targetGrade = grades[targetRule];
+
+            std::string finalRule;
+            bool valid = false;
+
+            for (int attempt = 0; attempt < 20 && !valid; attempt++) {
+                std::vector<std::string> pattern =
+                    (fillTarget == "1") ? patterns1[pick1(rng)] : patterns2[pick2(rng)];
+
+                std::string line = homeStr + ",1/4 -> ";
+
+                for (size_t s = 0; s < pattern.size(); s++) {
+                    std::string tok = pattern[s];
+                    if (tok == "H") tok = homeStr;
+
+                    bool curIsRest = (pattern[s] == "s");
+                    bool nextIsRest = (s + 1 < pattern.size() && pattern[s + 1] == "s");
+
+                    // Almost always 1/4.
+                    // For 2-beat loops, occasionally allow 1/2.
+                    std::string dur = "1/4";
+                    if (fillTarget == "2" && !curIsRest && prob(rng) < 0.18f) {
+                        dur = "1/2";
+                    }
+
+                    line += tok + "," + dur;
+
+                    if (s + 1 < pattern.size()) {
+                        bool glide = !curIsRest && !nextIsRest && prob(rng) < 0.35f;
+                        line += glide ? "^" : " ";
+                    } else {
+                        // Optional glide into the exit/fill step.
+                        bool glideToExit = !curIsRest && prob(rng) < 0.25f;
+                        line += glideToExit ? "^" : " ";
+                    }
+                }
+
+                // Exit step.
+                // If '=T' is available, this step both completes the loop
+                // and routes by degree toward the target rule.
+                std::string exitStep;
+                if (canUseFill) {
+                    exitStep = std::to_string(targetGrade) + ",=" + fillTarget;
+                } else {
+                    exitStep = std::to_string(targetGrade) + ",1/4";
+                }
+
+                line += exitStep;
+
+                // Long repetitions.
+                int reps = 8;
+                float pr = prob(rng);
+
+                if (fillTarget == "1") {
+                    if (pr < 0.20f) reps = 4;
+                    else if (pr < 0.75f) reps = 8;
+                    else reps = 16;
+                } else {
+                    reps = (pr < 0.50f) ? 4 : 8;
+                }
+
+                line += " *" + std::to_string(reps);
+
+                if (line.size() <= (size_t)RULE_FIELD_MAX_CHARS) {
+                    RuleTable testTable;
+                    std::string err;
+                    if (parseRuleLine(line, testTable, err)) {
+                        finalRule = line;
+                        valid = true;
+                    }
+                }
+            }
+
+            // Simple fallback.
+            if (!valid) {
+                std::string line = homeStr + ",1/4 -> " + homeStr + ",1/4 r,1/4 ";
+
+                if (canUseFill) {
+                    line += std::to_string(targetGrade) + ",=" + fillTarget;
+                } else {
+                    line += std::to_string(targetGrade) + ",1/4";
+                }
+
+                line += " *8";
+                finalRule = line;
+            }
+
+            fieldText[i] = finalRule;
+        }
+    }
+    
 
     // ---- Optional 'r' candidate lists -------------------------------------
 

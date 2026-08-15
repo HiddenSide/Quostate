@@ -82,7 +82,7 @@ struct RuleKeyHash {
     }
 };
 
-enum class SpecKind { FIXED, RANDOM_ANY, RANDOM_LIST, LAST_RANDOM, LAST_LIST };
+enum class SpecKind { FIXED, RANDOM_ANY, RANDOM_LIST, LAST_RANDOM, LAST_LIST, FILL };
 
 struct WeightedGradeItem {
     bool isRandom = false;
@@ -121,6 +121,7 @@ struct DurationSpec {
     SpecKind kind = SpecKind::FIXED;
     int fixedTicks = 0;
     bool zeroMarker = false; // true if this FIXED duration was literally '0' (skip marker)
+    int fillTargetTicks = 0; // used by FILL (=T)
     std::vector<WeightedDurationItem> items;
 };
 
@@ -314,33 +315,80 @@ inline bool parseGradeSpec(const std::string& strRaw, GradeSpec& out) {
 
 inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
     std::string str = trim(strRaw);
+
+    // Fill duration: =T
+    // Completes elapsed time inside the current repetition toward the
+    // smallest multiple of T that is >= elapsed.
+    if (!str.empty() && str.front() == '=') {
+        std::string target = trim(str.substr(1));
+        if (target.empty()) return false;
+
+        // Accept plain decimal numbers and simple unsigned fractions.
+        // Examples: =1, =0.5, =1/2, =3/4
+        static const std::regex plainRe("^([0-9]+(\\.[0-9]*)?|\\.[0-9]+)$");
+        static const std::regex fracRe("^[0-9]+/[0-9]+$");
+
+        if (!std::regex_match(target, plainRe) &&
+            !std::regex_match(target, fracRe)) {
+            return false;
+        }
+
+        int ticks = 0;
+        bool wasZero = false;
+        if (!parseDurationTicks(target, ticks, &wasZero)) return false;
+
+        // A fill target of zero makes no sense.
+        if (wasZero || ticks <= 0) return false;
+
+        out.kind = SpecKind::FILL;
+        out.fixedTicks = 0;
+        out.zeroMarker = false;
+        out.fillTargetTicks = ticks;
+        out.items.clear();
+        return true;
+    }
+
     if (str == "r") {
         out.kind = SpecKind::RANDOM_ANY;
         return true;
     }
+
     if (str == "k") {
         out.kind = SpecKind::LAST_RANDOM;
         return true;
     }
+
     if (str == "l") {
         out.kind = SpecKind::LAST_LIST;
         return true;
     }
+
     if (!str.empty() && str.front() == '<' && str.back() == '>') {
         std::string inner = str.substr(1, str.size() - 2);
         out.kind = SpecKind::RANDOM_LIST;
+
         for (auto& itemStr : splitTopLevel(inner, ',')) {
             std::string it = trim(itemStr);
+
             size_t colon = it.find(':');
             std::string valStr = it;
             double weight = 1.0;
+
             if (colon != std::string::npos) {
                 valStr = trim(it.substr(0, colon));
-                try { weight = std::stod(it.substr(colon + 1)); }
-                catch (...) { return false; }
+                try {
+                    weight = std::stod(it.substr(colon + 1));
+                } catch (...) {
+                    return false;
+                }
             }
+
             WeightedDurationItem item;
             item.weight = weight;
+
+            // Fill is not allowed inside duration lists.
+            if (!valStr.empty() && valStr.front() == '=') return false;
+
             if (valStr == "r") {
                 item.isRandom = true;
             } else if (valStr == "k") {
@@ -350,10 +398,13 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
             } else {
                 if (!parseDurationTicks(valStr, item.ticks)) return false;
             }
+
             out.items.push_back(item);
         }
+
         return !out.items.empty();
     }
+
     out.kind = SpecKind::FIXED;
     return parseDurationTicks(str, out.fixedTicks, &out.zeroMarker);
 }
@@ -623,6 +674,7 @@ private:
             case SpecKind::LAST_LIST: return lastListDuration;
             case SpecKind::RANDOM_ANY: return randomDurationAny();
             case SpecKind::RANDOM_LIST: return pickWeightedDuration(spec.items);
+            case SpecKind::FILL: return spec.fillTargetTicks; // normally resolved in expandOnce()
         }
         return PPQN;
     }
@@ -807,45 +859,93 @@ private:
             size_t n = prod.symbols.size();
             std::vector<GradeValue> resolvedGrades(n);
             std::vector<int> resolvedTicks(n);
+            std::vector<char> silentFill(n, 0);
+
+            // Elapsed ticks inside this repetition, used by '=T' fill durations.
+            long long elapsed = 0;
+
             for (size_t i = 0; i < n; i++) {
                 const Symbol& sym = prod.symbols[i];
+
                 GradeValue base = resolveGrade(sym.grade);
                 GradeValue finalGrade = base;
+
                 if (!base.isRest && sym.grade.chromaStep != 0) {
                     // (rep + 1) so the offset already applies on the very first (and possibly only)
                     // repetition, and grows cumulatively on further repeats when *N is used.
                     finalGrade.value = wrapGrade(base.value + sym.grade.chromaStep * (rep + 1), gradeMin, gradeMax);
                 }
+
                 resolvedGrades[i] = finalGrade;
-                resolvedTicks[i] = resolveDuration(sym.duration);
-            }
-            for (size_t i = 0; i < n; i++) {
-                const Symbol& sym = prod.symbols[i];
-                bool isZeroStep = (sym.duration.kind == SpecKind::FIXED && sym.duration.zeroMarker);
+
                 bool isVeryLast = (rep == prod.repeatCount - 1) && (i == n - 1);
 
-                if (isZeroStep && !isVeryLast) {
-                    // Fully omitted: no audible/timed footprint at all, as if this
-                    // step were never written. Its grade is still resolved above,
-                    // so any glide targeting it still works correctly.
-                    continue;
-                }
+                if (sym.duration.kind == SpecKind::FILL) {
+                    int target = sym.duration.fillTargetTicks;
 
-                ResolvedEvent ev(resolvedGrades[i], resolvedTicks[i]);
-                if (isZeroStep) {
-                    // Only reachable when isVeryLast: kept purely to drive
-                    // rule-routing once dequeued. Can't be truly zero-time --
-                    // one tick is needed before the next rule can be evaluated --
-                    // but the module must not treat it as a real note.
-                    ev.silent = true;
+                    // Smallest multiple of target that is >= elapsed.
+                    long long q = (elapsed + target - 1) / target;
+                    if (q < 1) q = 1;
+
+                    long long boundary = q * (long long)target;
+                    long long fill = boundary - elapsed;
+
+                    if (fill < 0) fill = 0;
+                    if (fill > MAX_TICKS) fill = MAX_TICKS;
+
+                    if (fill == 0) {
+                        // Exact multiple: keep a 1-tick routing step.
+                        // If it is a note degree, mark it silent so it does not
+                        // trigger a new note; if it is already a rest, let it
+                        // behave as a normal rest.
+                        resolvedTicks[i] = 1;
+                        silentFill[i] = resolvedGrades[i].isRest ? 0 : 1;
+                        elapsed += 1;
+                    } else {
+                        resolvedTicks[i] = (int)fill;
+                        elapsed += fill;
+                    }
+                } else {
+                    resolvedTicks[i] = resolveDuration(sym.duration);
+
+                    bool isZeroStep = (sym.duration.kind == SpecKind::FIXED && sym.duration.zeroMarker);
+                    bool omittedZero = (isZeroStep && !isVeryLast);
+
+                    if (!omittedZero) {
+                        elapsed += resolvedTicks[i];
+                    }
                 }
-                if (sym.glideToNext && i + 1 < n) {
-                    ev.hasGlide = true;
-                    ev.glideTarget = resolvedGrades[i + 1];
-                }
-                queue.push_back(ev);
             }
+
+    for (size_t i = 0; i < n; i++) {
+        const Symbol& sym = prod.symbols[i];
+
+        bool isZeroStep = (sym.duration.kind == SpecKind::FIXED && sym.duration.zeroMarker);
+        bool isVeryLast = (rep == prod.repeatCount - 1) && (i == n - 1);
+
+        if (isZeroStep && !isVeryLast) {
+            // Fully omitted: no audible/timed footprint at all, as if this
+            // step were never written. Its grade is still resolved above,
+            // so any glide targeting it still works correctly.
+            continue;
         }
+
+        ResolvedEvent ev(resolvedGrades[i], resolvedTicks[i]);
+
+        if (isZeroStep || silentFill[i]) {
+            // Zero-duration routing step, or exact fill (=0 calculated).
+            // The module must not treat it as a normal audible note.
+            ev.silent = true;
+        }
+
+        if (sym.glideToNext && i + 1 < n) {
+            ev.hasGlide = true;
+            ev.glideTarget = resolvedGrades[i + 1];
+        }
+
+        queue.push_back(ev);
+    }
+}
         return ExpandResult::PRODUCED;
     }
 

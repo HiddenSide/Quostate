@@ -663,6 +663,8 @@ private:
             }
             case SpecKind::RANDOM_LIST:
                 return pickWeightedGrade(spec.items);
+            case SpecKind::FILL:
+                return GradeValue(true, 0); // FILL solo aplica a duraciones
         }
         return {};
     }

@@ -79,8 +79,9 @@ struct LSystemModule : Module {
     int numChannels = 1;
     bool resetOnRun = true;
     // 0 = disabled: EOS fires only when the sequence "completes" (Rule 1, the
-    // initiator, fires again). >0: measured in raw CLOCK_INPUT pulses -- every
-    // (autoResetSteps * PPQN) clock pulses, this channel autoresets internally
+    // initiator, fires again). >0: measured in beats -- every (autoResetSteps *
+    // PPQN) internal ticks (i.e. autoResetSteps quarter notes), this channel
+    // autoresets internally
     // (equivalent to a Reset pulse, but with no cable-latency artifact) and
     // EOS fires only at that instant, decoupled from the rule engine entirely
     // so it can be used as a precise clock division for other modules.
@@ -103,11 +104,31 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger resetButtonTrigger;
     dsp::SchmittTrigger runTrigger;
 
+    // ---- Clock front-end (1 PPQN input) --------------------------------
+    // The external clock delivers ONE pulse per quarter note. The engine,
+    // however, runs at its native resolution of PPQN (48) internal ticks per
+    // beat, so this front-end does the multiplying: it measures the interval
+    // between consecutive pulses (= 1 beat), divides it by PPQN and generates
+    // the internal ticks with a fractional phase accumulator, re-anchoring the
+    // beat boundary on every incoming pulse. Rule parsing, durations, glide,
+    // EOR and autoreset therefore behave exactly as before -- they only ever
+    // see internal ticks.
+    static constexpr int64_t CLOCK_MIN_BEAT_SAMPLES = 64; // rejects glitchy ultra-fast pulses
+    static constexpr double CLOCK_GAP_ADOPT_RATIO = 1.5;  // gaps up to 1.5x the current beat adopt instantly
+    static constexpr double CLOCK_GAP_CONFIRM_TOL = 0.25; // tolerance when confirming an oversized gap
+    double samplesPerTick = 0;       // beat interval / PPQN, in samples
+    double tickPhase = 0.0;          // [0..1) progress toward the next internal tick
+    int64_t lastPulseSamplePos = -1; // sampleCounter value at the previous pulse
+    int64_t sampleCounter = 0;       // incremented once per process() frame
+    bool haveClockTempo = false;     // false until the first full beat has been measured
+    bool clockFrozen = false;        // true while holding output (next pulse overdue)
+    double pendingBeatSamples = 0.0; // oversized gap awaiting confirmation (see process())
+
     int ticksRemaining[MAX_CHANNELS] = {};
     bool gateHigh[MAX_CHANNELS] = {};
     float currentPitch[MAX_CHANNELS] = {};
     int retrigSamplesLeft[MAX_CHANNELS] = {};
-    int autoResetPulseCount[MAX_CHANNELS] = {}; // raw CLOCK_INPUT pulses since last autoreset
+    int autoResetPulseCount[MAX_CHANNELS] = {}; // internal ticks since last autoreset
     bool gliding[MAX_CHANNELS] = {};
     float glideStepV[MAX_CHANNELS] = {}; // V/oct added to currentPitch on every clock pulse while gliding
     // 0-10V, linearly mapped across the 7 rule rows (Rule 1 = 0V ... Rule 7 = 10V),
@@ -122,7 +143,7 @@ struct LSystemModule : Module {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
         configParam(RUN_PARAM, 0.f, 1.f, 0.f, "Run");
         configParam(RESET_PARAM, 0.f, 1.f, 0.f, "Reset");
-        configInput(CLOCK_INPUT, "Clock (48 PPQN)");
+        configInput(CLOCK_INPUT, "Clock (1 PPQN, 1 pulse per beat)");
         configInput(RESET_INPUT, "Reset");
         configInput(RUN_INPUT, "Run Toggle (trigger)");
         configInput(EVAL_INPUT, "Eval");
@@ -368,11 +389,11 @@ struct LSystemModule : Module {
         activeField = -1;
     }
 
-    void onClockTick(const ProcessArgs& args, int ch) {
-        // AAS (Autoreset After Steps): counts raw clock pulses, independent of
-        // the rule engine. 1 "step" = PPQN (48) pulses, matching the module's
-        // own tick resolution. When the threshold is reached, this channel is
-        // reset exactly like a Reset pulse.
+    void onInternalTick(const ProcessArgs& args, int ch) {
+        // AAS (Autoreset After Steps): counts internal ticks (PPQN per beat),
+        // independent of the rule engine. 1 "step" = 1 beat = PPQN internal
+        // ticks. When the threshold is reached, this channel is reset exactly
+        // like a Reset pulse.
         if (autoResetSteps > 0) {
             autoResetPulseCount[ch]++;
             if (autoResetPulseCount[ch] >= autoResetSteps * PPQN) {
@@ -492,6 +513,13 @@ struct LSystemModule : Module {
         }
     }
 
+    // Fires one internal engine tick on every active channel.
+    void fireInternalTick(const ProcessArgs& args) {
+        for (int ch = 0; ch < numChannels; ch++) {
+            onInternalTick(args, ch);
+        }
+    }
+
     void process(const ProcessArgs& args) override {
         if (runButtonTrigger.process(params[RUN_PARAM].getValue())) {
             running = !running;
@@ -556,10 +584,68 @@ struct LSystemModule : Module {
             }
         }
 
-        if (isRunning && inputs[CLOCK_INPUT].isConnected() &&
-            clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
-            for (int ch = 0; ch < numChannels; ch++) {
-                onClockTick(args, ch);
+        // ---- Clock front-end: 1 PPQN in -> PPQN internal ticks out -------
+        sampleCounter++;
+
+        if (isRunning && inputs[CLOCK_INPUT].isConnected()) {
+            if (clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
+                // Incoming beat pulse: re-anchor the internal beat boundary
+                // here and fire its downbeat tick immediately, so the sequence
+                // still starts on the very first clock pulse (as it always
+                // did). Sub-beat interpolation becomes available from the
+                // second pulse on, once a full beat has been measured.
+                double gap = (lastPulseSamplePos >= 0)
+                    ? double(sampleCounter - lastPulseSamplePos) : 0.0;
+                double prevBeat = samplesPerTick * (double)PPQN;
+
+                if (!haveClockTempo) {
+                    if (gap >= (double)CLOCK_MIN_BEAT_SAMPLES) {
+                        samplesPerTick = gap / (double)PPQN;
+                        haveClockTempo = true;
+                        pendingBeatSamples = 0.0;
+                    }
+                } else if (gap >= (double)CLOCK_MIN_BEAT_SAMPLES &&
+                           gap <= prevBeat * CLOCK_GAP_ADOPT_RATIO) {
+                    // Normal case (stable clock, moderate tempo moves):
+                    // adopt the fresh measurement directly.
+                    samplesPerTick = gap / (double)PPQN;
+                    pendingBeatSamples = 0.0;
+                } else if (gap > prevBeat * CLOCK_GAP_ADOPT_RATIO) {
+                    // Oversized gap: either a transport pause/resume or an
+                    // abrupt big slowdown. A single such gap is not trusted
+                    // (adopting it would drag one whole beat after every
+                    // pause); it is adopted only when the next gap confirms
+                    // a similar spacing.
+                    if (pendingBeatSamples > 0.0 &&
+                        std::abs(gap - pendingBeatSamples) <= pendingBeatSamples * CLOCK_GAP_CONFIRM_TOL) {
+                        samplesPerTick = gap / (double)PPQN;
+                        pendingBeatSamples = 0.0;
+                    } else {
+                        pendingBeatSamples = gap;
+                    }
+                }
+                // (gaps below CLOCK_MIN_BEAT_SAMPLES are glitches: keep tempo)
+
+                lastPulseSamplePos = sampleCounter;
+                clockFrozen = false;
+                tickPhase = 0.0;
+                fireInternalTick(args);
+            } else if (haveClockTempo) {
+                // Between pulses: interpolate the remaining internal ticks of
+                // the current beat at the measured rate. Once the next pulse
+                // is overdue, freeze instead of free-running -- matching how
+                // a stopped clock used to suspend the sequence mid-note.
+                double dueAt = double(lastPulseSamplePos) + samplesPerTick * (double)PPQN;
+                if (double(sampleCounter) <= dueAt) {
+                    tickPhase += 1.0 / samplesPerTick;
+                    while (tickPhase >= 1.0) {
+                        tickPhase -= 1.0;
+                        fireInternalTick(args);
+                    }
+                    clockFrozen = false;
+                } else {
+                    clockFrozen = true;
+                }
             }
         }
 
@@ -657,6 +743,15 @@ struct LSystemModule : Module {
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
             evalTriggered[ch] = false;
         }
+        // Clock front-end back to pristine: the tempo must be relearned from
+        // the next two incoming pulses.
+        haveClockTempo = false;
+        clockFrozen = false;
+        pendingBeatSamples = 0.0;
+        tickPhase = 0.0;
+        lastPulseSamplePos = -1;
+        samplesPerTick = 0;
+        sampleCounter = 0;
         rGradeListText.clear();
         rDurationListText.clear();
         rGradeListError = false;
@@ -1169,13 +1264,13 @@ struct LSystemModuleWidget : ModuleWidget {
             }
         }));
 
-        menu->addChild(createSubmenuItem("Autoreset after steps (48 clock pulses each)", "", [=](Menu* menu) {
+        menu->addChild(createSubmenuItem("Autoreset after steps (each step = 1 beat)", "", [=](Menu* menu) {
             static const struct { const char* name; int steps; } opts[] = {
                 {"Off", 0},
-                {"8 steps = 384 pulses", 8},
-                {"16 steps = 768 pulses", 16},
-                {"32 steps = 1536 pulses", 32},
-                {"64 steps = 3072 pulses", 64}
+                {"8 beats", 8},
+                {"16 beats", 16},
+                {"32 beats", 32},
+                {"64 beats", 64}
             };
             for (auto& o : opts) {
                 menu->addChild(createCheckMenuItem(o.name, "",

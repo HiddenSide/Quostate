@@ -5,7 +5,7 @@ These random events can be constrained through 2 text inputs at the bottom of th
 
 The module is monophonic and polyphonic up to 6 independent voices, each running its own randomization logic for degrees, durations, and possible paths between rules.
 
-The module needs a clock signal at its Clock input to work. It is designed to receive 48 PPQN (48 pulses = 1 quarter note).
+The module needs a clock signal at its Clock input to work. It expects 1 PPQN: one pulse per quarter note (one pulse = one beat). The module measures the time between pulses and subdivides each beat internally into 48 ticks, so all durations keep their exact musical meaning regardless of how slow the incoming clock is. Two consecutive pulses are needed before sub-beat timing is available; until then only the first tick of each beat fires. If a pulse arrives later than expected, the module holds its current state (pitch and gate freeze) instead of running on, exactly as when the clock stops.
 
 Up to 7 rules can be added in their respective text fields.
 Each rule field accepts up to 50 characters.
@@ -104,7 +104,7 @@ This input is similar and located next to Random pool for r (Degrees). These are
 ## Using the `^` operator (Glide):
 As you may have noticed, every step of a rule is separated from the next by a space. That space can be replaced with the `^` character whenever you want. This means the step to the left of `^` will glide — a linear pitch slide from its own degree toward the pitch of the step to its right. The glide's target step is left unaffected by it, unless that target is itself the start of another glide. The glide's duration equals the duration of the step that starts it. The glide has no effect if either the origin step or the target step is a silence (`s`).
 
-Glide is implemented as a stepped pitch slide: the V/Oct output moves once per clock tick, assuming 48 PPQN. It is linear over the step duration, but not sample-accurate.
+Glide is implemented as a stepped pitch slide: the V/Oct output moves once per internal tick (48 ticks per incoming clock pulse). It is linear over the step duration, but not sample-accurate.
 
 The `^` must sit directly against the step it modifies, with no space in between, in order to work. A space is fine on the other side, between `^` and the target step.
 
@@ -170,7 +170,7 @@ If a trigger arrives at the Reset input while Eval is connected, it performs an 
 If the Eval input receives a polyphonic signal, each channel can use its own Eval voltage. If it receives a monophonic signal, the first channel is used for all voices.
 
 ## Durations: allowed values and limits.
-Time unit: the module works internally in ticks, where 48 ticks = "1" (one beat/quarter note, since it's designed for 48 PPQN at the clock). Everything you write as a duration is converted to ticks on that basis.
+Time unit: the module works internally in ticks, where 48 ticks = "1" (one beat/quarter note). The Clock input receives one pulse per beat (1 PPQN) and the module subdivides each measured beat into those 48 internal ticks. Everything you write as a duration is converted to ticks on that basis.
 Two accepted formats, in any step, initiator, `<>` list, or pool:
 Plain number (integer or decimal): represents a number of beats. 1 = 48 ticks, 2 = 96 ticks, 0.5 = 24 ticks, 0.25 = 12 ticks.
 Fraction N/D (both unsigned integers): 1/2 = 24 ticks, 3/4 = 36 ticks, 1/8 = 6 ticks.
@@ -194,7 +194,7 @@ If `0` is used in the initiator of a rule, it becomes 1 tick.
 
 **Eval input mode**: Selects how the `Eval` input behaves: `Rule select (0-10V CV)` (queued or instant jump), `Loop / Hold rule (Gate)` (gate repeat), or `Advance on trigger (Trigger)` (stepped transitions).
 
-**Autoreset after steps**: Options to immediately reset the module after a certain number of steps based on the Clock input. Selectable options: Off (default), 8, 16, 32, or 64 steps.
+**Autoreset after steps**: Options to immediately reset the module after a certain number of beats (one step = one beat = one clock pulse). Selectable options: Off (default), 8, 16, 32, or 64 beats.
 
 **Scale**: Allows selecting the scale to which the rule degrees will be quantized. Natural major scale by default.
 

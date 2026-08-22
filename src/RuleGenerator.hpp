@@ -27,11 +27,6 @@ enum GenStyle {
     NUM_GEN_STYLES
 };
 
-struct DurationChoice {
-    int ticks;
-    const char* text;
-};
-
 struct GenProfile {
     int minSteps = 2;
     int maxSteps = 3;
@@ -43,7 +38,9 @@ struct GenProfile {
     float glideProb = 0.20f;
     float repeatProb = 0.30f;
     float branchExitProb = 0.35f;
-    std::vector<DurationChoice> durations;
+    // Duraciones candidatas como texto, en múltiplos/fracciones de UN PULSO
+    // de clock ("1" = un pulso completo, "1/4" = un cuarto de pulso).
+    std::vector<const char*> durations;
 };
 
 // Parámetros del entorno que el generador necesita conocer.
@@ -53,7 +50,6 @@ struct GeneratorConfig {
     int listFieldMaxChars = 24;
     int gradeMin = -8;
     int gradeMax = 16;
-    int ppqn = 48;
 };
 
 // Resultado completo de una generación.
@@ -67,7 +63,7 @@ struct GeneratedRuleSet {
 // Perfil por estilo
 // =======================================================================
 
-inline GenProfile getProfileForStyle(GenStyle style, int ppqn) {
+inline GenProfile getProfileForStyle(GenStyle style) {
     GenProfile p;
     switch (style) {
         case STYLE_ACID_TECHNO:
@@ -81,10 +77,7 @@ inline GenProfile getProfileForStyle(GenStyle style, int ppqn) {
             p.glideProb = 0.35f;
             p.repeatProb = 0.45f;
             p.branchExitProb = 0.30f;
-            p.durations = {
-                {ppqn / 4, "1/4"}, {ppqn / 8, "1/8"},
-                {ppqn / 2, "1/2"}, {ppqn / 3, "1/3"}
-            };
+            p.durations = {"1/4", "1/8", "1/2", "1/3"};
             break;
         case STYLE_AMBIENT:
             p.minSteps = 1;
@@ -97,10 +90,7 @@ inline GenProfile getProfileForStyle(GenStyle style, int ppqn) {
             p.glideProb = 0.30f;
             p.repeatProb = 0.35f;
             p.branchExitProb = 0.40f;
-            p.durations = {
-                {ppqn, "1"}, {ppqn * 2, "2"},
-                {ppqn / 2, "1/2"}, {(ppqn * 3) / 4, "3/4"}
-            };
+            p.durations = {"1", "2", "1/2", "3/4"};
             break;
         case STYLE_COMPLEX_CHAOS:
             p.minSteps = 2;
@@ -113,10 +103,7 @@ inline GenProfile getProfileForStyle(GenStyle style, int ppqn) {
             p.glideProb = 0.25f;
             p.repeatProb = 0.35f;
             p.branchExitProb = 0.50f;
-            p.durations = {
-                {ppqn / 4, "1/4"}, {ppqn / 2, "1/2"}, {ppqn, "1"},
-                {(ppqn * 3) / 4, "3/4"}, {ppqn / 3, "1/3"}
-            };
+            p.durations = {"1/4", "1/2", "1", "3/4", "1/3"};
             break;
         case STYLE_MELODIC:
         default:
@@ -130,10 +117,7 @@ inline GenProfile getProfileForStyle(GenStyle style, int ppqn) {
             p.glideProb = 0.20f;
             p.repeatProb = 0.30f;
             p.branchExitProb = 0.35f;
-            p.durations = {
-                {ppqn / 4, "1/4"}, {ppqn / 2, "1/2"},
-                {ppqn, "1"}, {(ppqn * 3) / 4, "3/4"}
-            };
+            p.durations = {"1/4", "1/2", "1", "3/4"};
             break;
     }
     return p;
@@ -239,7 +223,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                           std::vector<std::string>& rulesOut) {
     rulesOut.assign(cfg.numFields, "");
 
-    GenProfile prof = getProfileForStyle(style, cfg.ppqn);
+    GenProfile prof = getProfileForStyle(style);
 
     // ---- Iniciadores distintos arraigados en la escala -------------
     std::vector<int> degreeBase = {1, 3, 5, 2, 4, 7, 8, -2, 6, -1};
@@ -255,11 +239,11 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 
     std::uniform_int_distribution<int> durDist(0, (int)prof.durations.size() - 1);
 
-    struct InitiatorDef { int grade; int ticks; std::string durText; };
+    struct InitiatorDef { int grade; std::string durText; };
     std::vector<InitiatorDef> initiators(cfg.numFields);
     for (int i = 0; i < cfg.numFields; i++) {
         int di = (i == 0) ? (prof.durations.size() > 1 ? 1 : 0) : durDist(rng);
-        initiators[i] = { pickedGrades[i], prof.durations[di].ticks, prof.durations[di].text };
+        initiators[i] = { pickedGrades[i], prof.durations[di] };
     }
 
     // ---- Grafo dirigido: ciclo hamiltoniano ------------------------
@@ -278,6 +262,52 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
     std::uniform_int_distribution<int> stepsDist(prof.minSteps, prof.maxSteps);
     std::uniform_int_distribution<int> offsetDist(1, 2);
 
+    // ---- Contorno melódico -----------------------------------------
+    // Caminante de grados con pesos por intervalo: movimiento conjunto
+    // (-1/+1) favorecido sobre saltos, persistencia de direccion y
+    // recuperacion obligada tras un salto grande. El primer grado fijo del
+    // cuerpo se ajusta al tono de acorde (1/3/5/8) mas cercano, para que
+    // cada frase arranque consonante con la tonica.
+    const int CHORD_TONES[4] = {1, 3, 5, 8};
+    auto nearestChordTone = [&](int g) {
+        int best = CHORD_TONES[0], bd = INT_MAX;
+        for (int c : CHORD_TONES) {
+            int d = std::abs(c - g);
+            if (d < bd || (d == bd && c < best)) { bd = d; best = c; }
+        }
+        return best;
+    };
+
+    struct IntervalW { int iv; float w; };
+    auto pickInterval = [&](int& dir, int prevInt) -> int {
+        static const IntervalW base[] = {
+            {-1, 6.f}, {1, 6.f}, {-2, 3.f}, {2, 3.f}, {-3, 1.f}, {3, 1.f},
+            {-4, 0.6f}, {4, 0.6f}, {-7, 0.4f}, {7, 0.4f}};
+        const size_t N = sizeof(base) / sizeof(base[0]);
+        float ws[N];
+        float tot = 0;
+        for (size_t k = 0; k < N; k++) {
+            float w = base[k].w;
+            if (std::abs(prevInt) >= 4 && std::abs(base[k].iv) > 2)
+                w = 0.f; // tras un salto, solo grados conjuntos (recuperacion)
+            if (dir != 0 && ((base[k].iv > 0) == (dir > 0)))
+                w *= 1.6f; // persistencia de direccion
+            ws[k] = w;
+            tot += w;
+        }
+        std::uniform_real_distribution<float> dist(0.f, tot);
+        float r = dist(rng);
+        float acc = 0;
+        size_t sel = 0;
+        for (; sel + 1 < N; sel++) {
+            acc += ws[sel];
+            if (r <= acc) break;
+        }
+        int iv = base[sel].iv;
+        dir = (iv > 0) ? 1 : -1;
+        return iv;
+    };
+
     for (int i = 0; i < cfg.numFields; i++) {
         bool valid = false;
         int attempts = 0;
@@ -285,6 +315,17 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 
         while (!valid && attempts < 20) {
             attempts++;
+            // Estado del contorno y celula ritmica: frescos por intento para
+            // que cada linea candidata sea autosuficiente.
+            int contourCur = initiators[i].grade;
+            int contourDir = 0;
+            int prevIntv = 0;
+            bool snappedToChord = false;
+            // Celula ritmica del cuerpo: 45% unica duracion repetida (motivo
+            // hipnotico), 55% sorteos independientes (variacion).
+            bool uniRhythm = prob(rng) < 0.45f;
+            std::string uniDur = prof.durations[durDist(rng)];
+
             std::string line = std::to_string(initiators[i].grade) + "," +
                                initiators[i].durText + " -> ";
 
@@ -333,16 +374,23 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                     listUsed = true;
                     lastWasRest = false;
                 } else {
-                    int delta = (int)(rng() % 5) - 2; // -2 a +2
-                    int val = std::max(cfg.gradeMin,
-                              std::min(cfg.gradeMax, initiators[i].grade + delta));
-                    gStr = std::to_string(val);
+                    // Grado fijo: caminante de contorno. El primer grado fijo
+                    // de la frase se ajusta al tono de acorde mas cercano.
+                    if (!snappedToChord) {
+                        contourCur = nearestChordTone(contourCur);
+                        snappedToChord = true;
+                    }
+                    int iv = pickInterval(contourDir, prevIntv);
+                    prevIntv = iv;
+                    contourCur = std::max(cfg.gradeMin,
+                              std::min(cfg.gradeMax, contourCur + iv));
+                    gStr = std::to_string(contourCur);
                     lastWasRest = false;
                 }
 
                 // Duración
                 if (lastWasRest) {
-                    dStr = prof.durations[durDist(rng)].text;
+                    dStr = uniRhythm ? uniDur : prof.durations[durDist(rng)];
                 } else if (pD < prof.rProb * 0.5f) {
                     dStr = "r";
                 } else if (rUsed && pD < (prof.rProb * 0.5f) + prof.kProb * 0.5f) {
@@ -350,10 +398,10 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                 } else if (pD < 0.25f && prof.durations.size() >= 2) {
                     int di1 = rng() % prof.durations.size();
                     int di2 = (di1 + 1) % prof.durations.size();
-                    dStr = "<" + std::string(prof.durations[di1].text) + "," +
-                           prof.durations[di2].text + ">";
+                    dStr = std::string("<") + prof.durations[di1] + "," +
+                           prof.durations[di2] + ">";
                 } else {
-                    dStr = prof.durations[durDist(rng)].text;
+                    dStr = uniRhythm ? uniDur : prof.durations[durDist(rng)];
                 }
 
                 stepTokens.push_back(gStr + "," + dStr);
@@ -430,8 +478,9 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 // =======================================================================
 // Generador Acid / Techno
 // =======================================================================
-// Groove, repetición, loops hipnóticos, menos cambios de regla,
-// menos duraciones aleatorias y finalización de loop con '=T'.
+// Groove, repetición, loops hipnóticos y finalización de loop con '=T'.
+// Las reglas se encadenan entre sí mediante salidas ponderadas
+// hogar/destino: pegajosas pero con escape garantizado.
 inline void generateAcidRules(std::mt19937& rng,
                               const GeneratorConfig& cfg,
                               std::vector<std::string>& rulesOut,
@@ -520,12 +569,17 @@ inline void generateAcidRules(std::mt19937& rng,
         // Algunas a 2 beats añaden variación de frase.
         std::string fillTarget = (prob(rng) < 0.70f) ? "1" : "2";
 
-        // Alta probabilidad de auto-loop: la regla se repite a sí misma.
-        // Rule 1 (tónica) es especialmente pegajosa.
-        bool selfLoop = prob(rng) < ((i == 0) ? 0.80f : 0.60f);
-
-        int targetRule = selfLoop ? i : cycleNext[i];
-        int targetGrade = grades[targetRule];
+        // Salida "pegajosa con escape": lista ponderada entre el propio hogar
+        // y el siguiente del ciclo. Los grados acid son únicos por campo, así
+        // que el grado identifica la regla destino sin ambigüedad aunque la
+        // duración de relleno no coincida con el LHS (rescate por grado del
+        // motor). Tónica 50/50; resto ~33% quedarse / ~67% avanzar.
+        int fwdRule = cycleNext[i];
+        int targetGrade = grades[fwdRule];
+        int gSelf = home;
+        bool twoWay = (gSelf != targetGrade);
+        int wSelf = 1;
+        int wFwd = (i == 0) ? 1 : 2;
 
         std::string finalRule;
         bool valid = false;
@@ -562,25 +616,26 @@ inline void generateAcidRules(std::mt19937& rng,
             }
 
             // Paso de salida.
-            // Si '=T' está disponible, completa el loop y enruta por grado.
+            // Si '=T' está disponible, completa el loop y enruta por grado
+            // (lista ponderada hogar/destino); si no, duración fija 1/4.
+            std::string exitGrades = twoWay
+                ? "<" + homeStr + ":" + std::to_string(wSelf) + "," +
+                  std::to_string(targetGrade) + ":" + std::to_string(wFwd) + ">"
+                : homeStr;
             std::string exitStep;
             if (canUseFill) {
-                exitStep = std::to_string(targetGrade) + ",=" + fillTarget;
+                exitStep = exitGrades + ",=" + fillTarget;
             } else {
-                exitStep = std::to_string(targetGrade) + ",1/4";
+                exitStep = exitGrades + ",1/4";
             }
             line += exitStep;
 
-            // Repeticiones largas.
-            int reps = 8;
+            // Repeticiones: largas para el groove, pero sin enterrar la
+            // progresión del ciclo.
+            int reps;
             float pr = prob(rng);
-            if (fillTarget == "1") {
-                if (pr < 0.20f) reps = 4;
-                else if (pr < 0.75f) reps = 8;
-                else reps = 16;
-            } else {
-                reps = (pr < 0.50f) ? 4 : 8;
-            }
+            if (fillTarget == "1") reps = (pr < 0.30f) ? 4 : 8;
+            else reps = (pr < 0.50f) ? 4 : 8;
             line += " *" + std::to_string(reps);
 
             if (line.size() <= (size_t)cfg.ruleFieldMaxChars) {

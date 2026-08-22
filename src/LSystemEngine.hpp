@@ -13,8 +13,6 @@
 
 namespace lsys {
 
-constexpr int PPQN = 48; // ticks por "ciclo"
-
 inline int floorDiv(int a, int b) {
     int d = a / b;
     int r = a % b;
@@ -25,6 +23,48 @@ inline int floorMod(int a, int b) {
     int r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
     return r;
+}
+
+// ---------------------------------------------------------------------
+// Límites y aritmética de duraciones
+// ---------------------------------------------------------------------
+
+// Sane ceilings for anything the user can type as a plain literal (grade
+// values, chroma +N/-N offsets, *N repeat counts, and resolved tick counts).
+// These exist purely to keep parsing exception-free and to keep later
+// arithmetic (offsets * repeats, etc.) safely within int range -- a musically
+// reasonable module never needs numbers anywhere near these limits.
+constexpr int MAX_USER_INT = 100000;
+constexpr int MAX_REPEAT_COUNT = 256;
+constexpr int MAX_TICKS = 1000000; // tope de subpulsos por evento
+
+// Máxima subdivisión interna por pulso: es el MCM de los denominadores
+// presentes en el set de reglas y pools, con este tope para acotar la tasa
+// de eventos internos.
+constexpr int MAX_SUBDIVISION = 96;
+
+// Resolución mínima del 'fake slide' (símbolos unidos por '^'): el pitch
+// avanza un escalón por subpulso interno, así que sin subdivision suficiente
+// el intervalo completo se salta en un solo tick (salto instantáneo).
+constexpr int GLIDE_MIN_SUBDIVISION = 16;
+constexpr double GLIDE_STEPS_PER_SEMITONE = 4.0; // ≈25 cents por escalón
+
+inline long long gcdLL(long long a, long long b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b) { long long t = a % b; a = b; b = t; }
+    return a > 0 ? a : 1;
+}
+
+// Convierte una duración racional (num/den PULSOS) a subpulsos enteros para
+// una subdivisión dada: redondeo al más cercano, mínimo 1 si num > 0, y 0
+// solo cuando num == 0. Nunca excede MAX_TICKS.
+inline int toSubpulses(long long num, long long den, int subdivision) {
+    if (num <= 0 || den <= 0 || subdivision <= 0) return 0;
+    long long v = llround((double)num * (double)subdivision / (double)den);
+    if (v < 1) v = 1;
+    if (v > (long long)MAX_TICKS) v = MAX_TICKS;
+    return (int)v;
 }
 
 // ---------------------------------------------------------------------
@@ -58,8 +98,9 @@ struct RuleKey {
 
 // A dequeued, playable event. Carries the RuleKey (grade+duration, used for
 // audio output and for chaining to the next rule) plus an optional pitch-glide
-// target: a 'fake slide' realized as a fixed per-clock-pulse V/oct step,
-// assuming a 48 PPQN clock (see LSystemModule::onClockTick).
+// target: a 'fake slide' realized as a fixed per-subpulse V/oct step (see
+// LSystemModule::onInternalTick). Durations are in subpulsos: partes enteras
+// del pulso de clock entrante según la subdivisión activa.
 struct ResolvedEvent {
     RuleKey key;
     bool hasGlide = false;
@@ -96,8 +137,9 @@ struct WeightedDurationItem {
     bool isRandom = false;
     bool isLastRandom = false; // 'k' inside a <...> list
     bool isLastList = false;   // 'l' inside a <...> list
-    int ticks = 0;
     double weight = 1.0;
+    int num = 1, den = 1;      // pulsos crudos (parser): num/den
+    int ticks = 0;             // subpulsos resueltos (finalize)
 };
 
 // A single entry in the 'r' candidate pools (LSystemModule's r-Degrees / r-Durations
@@ -110,19 +152,29 @@ struct WeightedPoolItem {
     WeightedPoolItem(int v, double w) : value(v), weight(w) {}
 };
 
+struct DurationSpec {
+    SpecKind kind = SpecKind::FIXED;
+    bool zeroMarker = false;      // true si este FIXED fue literalmente '0' (skip marker)
+    int num = 1, den = 1;         // FIXED crudo: num/den pulsos
+    int fillNum = 1, fillDen = 1; // FILL (=T) crudo: rellena hacia múltiplos de T pulsos
+    std::vector<WeightedDurationItem> items;
+    int fixedTicks = 0;           // resuelto: subpulsos (finalize)
+    int fillTargetTicks = 0;      // resuelto: subpulsos (finalize)
+
+    // Materializa los valores enteros en subpulsos para la subdivisión dada.
+    // Debe llamarse tras el parse y antes de que el motor use la spec.
+    void finalize(int subdivision) {
+        fixedTicks = toSubpulses(num, den, subdivision);
+        fillTargetTicks = toSubpulses(fillNum, fillDen, subdivision);
+        for (auto& it : items) it.ticks = toSubpulses(it.num, it.den, subdivision);
+    }
+};
+
 struct GradeSpec {
     SpecKind kind = SpecKind::FIXED;
     GradeValue fixedValue;
     int chromaStep = 0;
     std::vector<WeightedGradeItem> items;
-};
-
-struct DurationSpec {
-    SpecKind kind = SpecKind::FIXED;
-    int fixedTicks = 0;
-    bool zeroMarker = false; // true if this FIXED duration was literally '0' (skip marker)
-    int fillTargetTicks = 0; // used by FILL (=T)
-    std::vector<WeightedDurationItem> items;
 };
 
 struct Symbol {
@@ -172,15 +224,6 @@ inline std::vector<std::string> splitTopLevel(const std::string& s, char sep) {
     return parts;
 }
 
-// Sane ceilings for anything the user can type as a plain literal (grade
-// values, chroma +N/-N offsets, *N repeat counts, and resolved tick counts).
-// These exist purely to keep parsing exception-free and to keep later
-// arithmetic (offsets * repeats, etc.) safely within int range -- a musically
-// reasonable module never needs numbers anywhere near these limits.
-constexpr int MAX_USER_INT = 100000;
-constexpr int MAX_REPEAT_COUNT = 256;
-constexpr int MAX_TICKS = 1000000; // ~20,833 cycles at 48 PPQN
-
 // Parses a plain (optionally signed) integer literal with a hard magnitude
 // limit, and NEVER throws: malformed or too-long input is rejected up front,
 // before it ever reaches std::stol, so a huge pasted number is just an
@@ -204,31 +247,45 @@ inline bool parseBoundedInt(const std::string& tokRaw, int& out, int limit = MAX
     }
 }
 
-inline bool parseDurationTicks(const std::string& tokRaw, int& outTicks, bool* wasZero = nullptr) {
+// Parses a duration written as a multiple/fraction of ONE CLOCK PULSE and
+// returns it REDUCED as a rational (num/den with den >= 1). Accepts plain
+// integers ("2"), fractions ("1/4") and finite decimals ("0.25"). Rejects
+// negatives and malformed tokens; NEVER throws.
+inline bool parseDurationPulses(const std::string& tokRaw, long long& numOut, long long& denOut) {
     std::string tok = trim(tokRaw);
-    static const std::regex fracRe("^(\\d+)/(\\d+)$");
+    if (tok.empty()) return false;
+    static const std::regex fracRe("^([0-9]{1,9})/([0-9]{1,9})$");
+    static const std::regex decRe("^([0-9]{0,9})(\\.[0-9]{1,9})?$");
     std::smatch m;
-    double cycles;
+    long long num = -1, den = 1;
     try {
         if (std::regex_match(tok, m, fracRe)) {
-            double num = std::stod(m[1].str());
-            double den = std::stod(m[2].str());
-            if (den == 0.0) return false;
-            cycles = num / den;
+            num = std::stoll(m[1].str());
+            den = std::stoll(m[2].str());
+        } else if (std::regex_match(tok, m, decRe)) {
+            std::string ip = m[1].str();
+            std::string fp = m[2].str(); // "" or ".ddd"
+            if (ip.empty() && fp.empty()) return false;
+            num = ip.empty() ? 0 : std::stoll(ip);
+            den = 1;
+            if (fp.size() > 1) {
+                long long scale = 1;
+                for (size_t i = 1; i < fp.size(); i++) scale *= 10;
+                num = num * scale + std::stoll(fp.substr(1));
+                den = scale;
+            }
         } else {
-            cycles = std::stod(tok);
+            return false;
         }
     } catch (...) {
         return false;
     }
-    if (!std::isfinite(cycles)) return false;
-    if (wasZero) *wasZero = (cycles == 0.0);
-    // Clamp before rounding: extreme values here would otherwise overflow the
-    // long->int conversion below (implementation-defined/UB on such values).
-    double ticksD = cycles * PPQN;
-    if (ticksD > (double)MAX_TICKS) { outTicks = MAX_TICKS; return true; }
-    if (ticksD < 1.0) { outTicks = 1; return true; }
-    outTicks = (int)std::lround(ticksD);
+    if (num < 0 || den <= 0) return false;
+    long long g = gcdLL(num, den);
+    num /= g;
+    den /= g;
+    numOut = num;
+    denOut = den;
     return true;
 }
 
@@ -317,33 +374,19 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
     std::string str = trim(strRaw);
 
     // Fill duration: =T
-    // Completes elapsed time inside the current repetition toward the
-    // smallest multiple of T that is >= elapsed.
+    // Completa el tiempo transcurrido dentro de la repetición hacia el
+    // múltiplo siguiente de T pulsos.
     if (!str.empty() && str.front() == '=') {
         std::string target = trim(str.substr(1));
-        if (target.empty()) return false;
-
-        // Accept plain decimal numbers and simple unsigned fractions.
-        // Examples: =1, =0.5, =1/2, =3/4
-        static const std::regex plainRe("^([0-9]+(\\.[0-9]*)?|\\.[0-9]+)$");
-        static const std::regex fracRe("^[0-9]+/[0-9]+$");
-
-        if (!std::regex_match(target, plainRe) &&
-            !std::regex_match(target, fracRe)) {
-            return false;
-        }
-
-        int ticks = 0;
-        bool wasZero = false;
-        if (!parseDurationTicks(target, ticks, &wasZero)) return false;
-
+        long long fn = 0, fd = 1;
+        if (!parseDurationPulses(target, fn, fd)) return false;
         // A fill target of zero makes no sense.
-        if (wasZero || ticks <= 0) return false;
+        if (fn <= 0) return false;
 
         out.kind = SpecKind::FILL;
-        out.fixedTicks = 0;
         out.zeroMarker = false;
-        out.fillTargetTicks = ticks;
+        out.fillNum = fn;
+        out.fillDen = fd;
         out.items.clear();
         return true;
     }
@@ -389,6 +432,7 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
             // Fill is not allowed inside duration lists.
             if (!valStr.empty() && valStr.front() == '=') return false;
 
+            long long fn = 0, fd = 1;
             if (valStr == "r") {
                 item.isRandom = true;
             } else if (valStr == "k") {
@@ -396,7 +440,9 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
             } else if (valStr == "l") {
                 item.isLastList = true;
             } else {
-                if (!parseDurationTicks(valStr, item.ticks)) return false;
+                if (!parseDurationPulses(valStr, fn, fd)) return false;
+                item.num = (int)fn;
+                item.den = (int)fd;
             }
 
             out.items.push_back(item);
@@ -406,10 +452,19 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
     }
 
     out.kind = SpecKind::FIXED;
-    return parseDurationTicks(str, out.fixedTicks, &out.zeroMarker);
+    long long fn = 0, fd = 1;
+    if (!parseDurationPulses(str, fn, fd)) return false;
+    out.zeroMarker = (fn == 0);
+    out.num = (int)fn;
+    out.den = (int)fd;
+    return true;
 }
 
-inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::string& error) {
+// Parsea una línea de regla. `subdivision` convierte las duraciones (en
+// pulsos) a subpulsos enteros; si `densOut` no es nulo, se le agregan los
+// denominadores encontrados (para calcular la subdivisión dinámica).
+inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::string& error,
+                          int subdivision = 1, std::vector<long long>* densOut = nullptr) {
     std::string line = trim(lineRaw);
     if (line.empty() || line.rfind("--", 0) == 0) return true;
 
@@ -427,15 +482,17 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
         return false;
     }
     GradeValue keyGrade;
-    int keyTicks;
+    long long keyNum = 0, keyDen = 1;
     if (!parseGradeValue(trim(leftParts[0]), keyGrade)) {
         error = "grado de clave invalido";
         return false;
     }
-    if (!parseDurationTicks(trim(leftParts[1]), keyTicks)) {
+    if (!parseDurationPulses(trim(leftParts[1]), keyNum, keyDen)) {
         error = "duracion de clave invalida";
         return false;
     }
+    if (densOut && keyNum > 0) densOut->push_back(keyDen);
+    int keyTicks = toSubpulses(keyNum, keyDen, subdivision);
     RuleKey key{keyGrade, keyTicks};
 
     Production prod;
@@ -499,6 +556,23 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
             error = "duracion invalida: '" + pair[1] + "'";
             return false;
         }
+        if (densOut) {
+            switch (sym.duration.kind) {
+                case SpecKind::FIXED:
+                    if (sym.duration.num > 0) densOut->push_back(sym.duration.den);
+                    break;
+                case SpecKind::FILL:
+                    densOut->push_back(sym.duration.fillDen);
+                    break;
+                case SpecKind::RANDOM_LIST:
+                    for (auto& it : sym.duration.items)
+                        if (it.num > 0) densOut->push_back(it.den);
+                    break;
+                default:
+                    break; // RANDOM_ANY / LAST_* : denominador viene del pool
+            }
+        }
+        sym.duration.finalize(subdivision);
         sym.glideToNext = tokenGlideNext[ti];
         prod.symbols.push_back(sym);
     }
@@ -524,6 +598,30 @@ public:
     void setInitiator(RuleKey init) { initiator = init; }
     void setFallback(FallbackMode m) { fallback = m; }
     void setGradeRange(int mn, int mx) { gradeMin = mn; gradeMax = mx; }
+    // Subdivisión interna: subpulsos por pulso de clock (MCM de los
+    // denominadores del set de reglas). Todas las duraciones resueltas del
+    // motor se expresan en subpulsos.
+    void setSubdivision(int s) { subdivision = std::max(1, s); }
+    // Migracion suave de subdivision: reescala el estado EN CURSO (clave
+    // actual, ultima clave disparada, eventos encolados y memorias 'k'/'l'
+    // de duracion) de la unidad vieja a la nueva. Asi los cambios de D por
+    // edicion en caliente no alteran las duraciones reales ni provocan
+    // saltos audibles: la nota que esta sonando conserva su longitud en
+    // pulsos y las claves siguen coincidiendo con la tabla nueva. Las
+    // tablas/reglas llegan aparte, ya expresadas en la unidad nueva.
+    void migrateSubdivision(int oldS, int newS) {
+        if (oldS == newS || oldS < 1 || newS < 1) return;
+        double r = (double)newS / (double)oldS;
+        auto scale = [&](int t) -> int {
+            long long v = llround((double)t * r);
+            return (int)std::max(1LL, std::min((long long)MAX_TICKS, v));
+        };
+        current.durationTicks = scale(current.durationTicks);
+        lastFiredKey.durationTicks = scale(lastFiredKey.durationTicks);
+        for (auto& ev : queue) ev.key.durationTicks = scale(ev.key.durationTicks);
+        lastRandomDuration = scale(lastRandomDuration);
+        lastListDuration = scale(lastListDuration);
+    }
     // Optional restricted value sets for 'r' (RANDOM_ANY). Empty = unrestricted
     // (grade: uniform over [gradeMin,gradeMax]; duration: the built-in pool).
     void setRandomGradeList(std::vector<WeightedPoolItem> list) { randomGradeList = std::move(list); }
@@ -536,9 +634,9 @@ public:
         eorFired = false;
         eosFired = false;
         lastRandomGrade = 1;
-        lastRandomDuration = PPQN;
+        lastRandomDuration = subdivision;
         lastListGrade = 1;
-        lastListDuration = PPQN;
+        lastListDuration = subdivision;
         productionCycleIndex.clear();
         // Starting the sequence from the top isn't a completion event: suppress
         // EOR/EOS on the very first rule that fires after this reset (it's
@@ -576,9 +674,9 @@ public:
         eorFired = false;
         eosFired = false;
         lastRandomGrade = 1;
-        lastRandomDuration = PPQN;
+        lastRandomDuration = subdivision;
         lastListGrade = 1;
-        lastListDuration = PPQN;
+        lastListDuration = subdivision;
         productionCycleIndex.clear();
         suppressEndSignalsOnce = true;
     }
@@ -590,9 +688,9 @@ public:
         eorFired = false;
         eosFired = false;
         lastRandomGrade = 1;
-        lastRandomDuration = PPQN;
+        lastRandomDuration = subdivision;
         lastListGrade = 1;
-        lastListDuration = PPQN;
+        lastListDuration = subdivision;
         productionCycleIndex.clear();
         suppressEndSignalsOnce = true;
     }
@@ -678,7 +776,7 @@ private:
             case SpecKind::RANDOM_LIST: return pickWeightedDuration(spec.items);
             case SpecKind::FILL: return spec.fillTargetTicks; // normally resolved in expandOnce()
         }
-        return PPQN;
+        return subdivision;
     }
 
     int randomGradeAny() {
@@ -694,11 +792,10 @@ private:
     int randomDurationAny() {
         if (!randomDurationList.empty()) {
             lastRandomDuration = pickWeightedPoolItem(randomDurationList);
-        } else if (!durationPool.empty()) {
-            std::uniform_int_distribution<size_t> dist(0, durationPool.size() - 1);
-            lastRandomDuration = durationPool[dist(rng)];
         } else {
-            lastRandomDuration = PPQN;
+            std::uniform_int_distribution<int> dist(0, 3);
+            int i = dist(rng);
+            lastRandomDuration = toSubpulses(BUILTIN_POOL_NUM[i], BUILTIN_POOL_DEN[i], subdivision);
         }
         return lastRandomDuration;
     }
@@ -958,17 +1055,22 @@ private:
     RuleKey initiator;
     FallbackMode fallback = FallbackMode::LOOP_TO_INITIATOR;
     int gradeMin = -8, gradeMax = 16;
-    std::vector<int> durationPool = {PPQN, PPQN / 2, PPQN * 2, PPQN / 4};
+    int subdivision = 1; // subpulsos por pulso de clock (ver setSubdivision)
     std::vector<WeightedPoolItem> randomGradeList;    // optional restricted candidates for 'r' (grade)
-    std::vector<WeightedPoolItem> randomDurationList; // optional restricted candidates for 'r' (duration), in ticks
+    std::vector<WeightedPoolItem> randomDurationList; // optional restricted candidates for 'r' (duration), in subpulsos
+
+    // Pool interno de duraciones para 'r' sin lista definida: 1, 1/2, 2 y
+    // 1/4 de pulso, resueltos a subpulsos según la subdivisión activa.
+    static constexpr int BUILTIN_POOL_NUM[4] = {1, 1, 2, 1};
+    static constexpr int BUILTIN_POOL_DEN[4] = {1, 2, 1, 4};
 
     RuleKey current;
     std::deque<ResolvedEvent> queue;
 
     int lastRandomGrade = 1;
-    int lastRandomDuration = PPQN;
+    int lastRandomDuration = subdivision;
     int lastListGrade = 1;      // last value produced by ANY <...> list, for 'l'
-    int lastListDuration = PPQN;
+    int lastListDuration = subdivision;
 
     std::mt19937 rng{std::random_device{}()};
 };

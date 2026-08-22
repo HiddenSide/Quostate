@@ -13,6 +13,10 @@
 
 using namespace lsys;
 
+// Definicion (C++11) de miembros static constexpr odr-used por el motor.
+constexpr int LSystemEngine::BUILTIN_POOL_NUM[4];
+constexpr int LSystemEngine::BUILTIN_POOL_DEN[4];
+
 // =======================================================================
 // MODULE
 // =======================================================================
@@ -79,9 +83,8 @@ struct LSystemModule : Module {
     int numChannels = 1;
     bool resetOnRun = true;
     // 0 = disabled: EOS fires only when the sequence "completes" (Rule 1, the
-    // initiator, fires again). >0: measured in beats -- every (autoResetSteps *
-    // PPQN) internal ticks (i.e. autoResetSteps quarter notes), this channel
-    // autoresets internally
+    // initiator, fires again). >0: measured in PULSES -- every (autoResetSteps)
+    // incoming clock pulses this channel autoresets internally
     // (equivalent to a Reset pulse, but with no cable-latency artifact) and
     // EOS fires only at that instant, decoupled from the rule engine entirely
     // so it can be used as a precise clock division for other modules.
@@ -104,36 +107,29 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger resetButtonTrigger;
     dsp::SchmittTrigger runTrigger;
 
-    // ---- Clock front-end (1 PPQN input) --------------------------------
-    // The external clock delivers ONE pulse per quarter note. The engine,
-    // however, runs at its native resolution of PPQN (48) internal ticks per
-    // beat, so this front-end does the multiplying: it measures the interval
-    // between consecutive pulses (= 1 beat), divides it by PPQN and generates
-    // the internal ticks with a fractional phase accumulator, re-anchoring the
-    // beat boundary on every incoming pulse. Rule parsing, durations, glide,
-    // EOR and autoreset therefore behave exactly as before -- they only ever
-    // see internal ticks.
-    static constexpr int64_t CLOCK_MIN_BEAT_SAMPLES = 64; // rejects glitchy ultra-fast pulses
-    static constexpr double CLOCK_GAP_ADOPT_RATIO = 1.5;  // gaps up to 1.5x the current beat adopt instantly
-    static constexpr double CLOCK_GAP_CONFIRM_TOL = 0.25; // tolerance when confirming an oversized gap
-    double samplesPerTick = 0;       // beat interval / PPQN, in samples
-    double tickPhase = 0.0;          // [0..1) progress toward the next internal tick
-    int64_t lastPulseSamplePos = -1; // sampleCounter value at the previous pulse
-    int64_t sampleCounter = 0;       // incremented once per process() frame
-    bool haveClockTempo = false;     // false until the first full beat has been measured
-    bool clockFrozen = false;        // true while holding output (next pulse overdue)
-    double pendingBeatSamples = 0.0; // oversized gap awaiting confirmation (see process())
-    // Armed by every reset (input, button, AAS autoreset, patch load): the
-    // sequence holds frozen until the NEXT incoming clock pulse, so a restarted
-    // sequence lands exactly ON that pulse -- aligned with anything else
-    // clocked from the same LFO (kick, etc.). Cleared by that first pulse.
+    // ---- Clock front-end -------------------------------------------------
+    // El clock externo entrega UN pulso por negra. El motor corre en
+    // SUBPULSOS: cada pulso entrante se divide en 'pulseSubdivision' partes
+    // iguales (MCM dinamico de los denominadores presentes en las reglas y
+    // pools). Un paso "1" dura exactamente un pulso, "1/2" medio pulso y "2"
+    // dos pulsos. Los downbeats estan anclados al flanco real del pulso y el
+    // resto fraccional se arrastra entre pulsos (nunca se descarta), asi que
+    // la tasa promedio coincide siempre con el clock: sin deriva acumulativa.
+    static constexpr int64_t CLOCK_MIN_PULSE_SAMPLES = 64; // rechaza glitches
+    int pulseSubdivision = 1;        // subpulsos por pulso (recalculado al editar reglas)
+    double samplesPerPulse = 0.0;    // intervalo medido entre flancos, en muestras
+    int64_t lastEdgeSamplePos = -1;  // sampleCounter del ultimo flanco
+    double fracPos = 0.0;            // posicion [0..1+) dentro del pulso actual
+    int nextBoundary = 1;            // proximo limite interior del pulso (1..D-1)
+    bool haveClockTempo = false;     // falso hasta medir el primer intervalo completo
+    bool clockFrozen = false;        // flanco atrasado: retener hasta que llegue
     bool awaitingClockAfterReset = false;
-
+    int aasPulseCounter = 0;         // pulsos desde el ultimo autoreset (AAS)
+    int64_t sampleCounter = 0;       // incrementado una vez por frame de process()
     int ticksRemaining[MAX_CHANNELS] = {};
     bool gateHigh[MAX_CHANNELS] = {};
     float currentPitch[MAX_CHANNELS] = {};
     int retrigSamplesLeft[MAX_CHANNELS] = {};
-    int autoResetPulseCount[MAX_CHANNELS] = {}; // internal ticks since last autoreset
     bool gliding[MAX_CHANNELS] = {};
     float glideStepV[MAX_CHANNELS] = {}; // V/oct added to currentPitch on every clock pulse while gliding
     // 0-10V, linearly mapped across the 7 rule rows (Rule 1 = 0V ... Rule 7 = 10V),
@@ -148,7 +144,7 @@ struct LSystemModule : Module {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
         configParam(RUN_PARAM, 0.f, 1.f, 0.f, "Run");
         configParam(RESET_PARAM, 0.f, 1.f, 0.f, "Reset");
-        configInput(CLOCK_INPUT, "Clock (1 PPQN, 1 pulse per beat)");
+        configInput(CLOCK_INPUT, "Clock (1 pulse per quarter note)");
         configInput(RESET_INPUT, "Reset");
         configInput(RUN_INPUT, "Run Toggle (trigger)");
         configInput(EVAL_INPUT, "Eval");
@@ -177,7 +173,7 @@ struct LSystemModule : Module {
 
     }
 
-    void recompileField(int idx) {
+    void recompileField(int idx, int subdiv) {
         fieldError[idx] = false;
         fieldErrorMsg[idx].clear();
         fieldKeyValid[idx] = false;
@@ -194,15 +190,15 @@ struct LSystemModule : Module {
 
         RuleTable tmp;
         std::string err;
-        if (parseRuleLine(t, tmp, err)) {
+        if (parseRuleLine(t, tmp, err, subdiv)) {
             auto arrow = t.find("->");
             auto leftParts = splitTopLevel(trim(t.substr(0, arrow)), ',');
             GradeValue g;
-            int ticks;
+            long long num = 0, den = 1;
             if (leftParts.size() == 2 &&
                 parseGradeValue(trim(leftParts[0]), g) &&
-                parseDurationTicks(trim(leftParts[1]), ticks)) {
-                fieldKey[idx] = RuleKey{g, ticks};
+                parseDurationPulses(trim(leftParts[1]), num, den)) {
+                fieldKey[idx] = RuleKey{g, toSubpulses(num, den, subdiv)};
                 fieldKeyValid[idx] = true;
             }
             // Valid: promote to committed, so the engine keeps using it even if
@@ -217,7 +213,70 @@ struct LSystemModule : Module {
     }
 
     void recompileAll() {
-        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i);
+        int oldSub = pulseSubdivision; // para migrar estado en curso si cambia
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
+
+        // Pass 1: recolectar denominadores de duraciones (reglas + pool 'r')
+        // para derivar la subdivision dinamica: MCM acotado por MAX_SUBDIVISION.
+        std::vector<long long> dens;
+        RuleTable tmpTable;
+        std::string tmpErr;
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            std::string t = trim(fieldTextCommitted[i]);
+            if (t.empty()) continue;
+            parseRuleLine(t, tmpTable, tmpErr, 1, &dens);
+        }
+        for (auto& e : rDurationPoolRational) dens.push_back(e.den);
+        long long D = 1;
+        for (long long d : dens) {
+            if (d <= 1) continue;
+            long long g = gcdLL(D, d);
+            long long next = D / g * d;
+            if (next > MAX_SUBDIVISION) continue;
+            D = next;
+        }
+
+        // Requisito de resolucion del glide ('^'): cada escalon no deberia
+        // superar ~25 cents. Para cada simbolo con glideToNext y objetivo
+        // predecible (grados FIXED audibles + duracion FIXED) se exige
+        // D >= ceil(delta_semitonos * pasos/semitono * den / num). Grados o
+        // duraciones aleatorias solo aportan el piso absoluto, porque su
+        // objetivo es impredecible en tiempo de compilacion. La fase se
+        // re-ancla en cada flanco real, asi que subir D no reintroduce deriva:
+        // solo anade fronteras interiores dentro del pulso.
+        bool anyGlide = false;
+        long long glideReq = 0;
+        for (auto& kv : tmpTable) {
+            for (auto& prod : kv.second) {
+                size_t n = prod.symbols.size();
+                for (size_t i = 0; i + 1 < n; i++) {
+                    const Symbol& s = prod.symbols[i];
+                    if (!s.glideToNext) continue;
+                    anyGlide = true;
+                    if (s.duration.kind != SpecKind::FIXED || s.duration.num <= 0) continue;
+                    if (i + 1 >= prod.symbols.size()) continue;
+                    const Symbol& nxt = prod.symbols[i + 1];
+                    if (s.grade.kind != SpecKind::FIXED || nxt.grade.kind != SpecKind::FIXED) continue;
+                    const GradeValue& a = s.grade.fixedValue;
+                    const GradeValue& b = nxt.grade.fixedValue;
+                    if (a.isRest || b.isRest) continue;
+                    double semi = std::abs(degreeToNote(b.value, scale, rootNote) -
+                                           degreeToNote(a.value, scale, rootNote));
+                    if (semi <= 0.0) continue;
+                    long long req = (long long)std::ceil(semi * GLIDE_STEPS_PER_SEMITONE *
+                                                         (double)s.duration.den / (double)s.duration.num);
+                    if (req > glideReq) glideReq = req;
+                }
+            }
+        }
+        if (anyGlide) {
+            D = std::max(D, std::min(glideReq, (long long)MAX_SUBDIVISION));
+            D = std::max(D, (long long)GLIDE_MIN_SUBDIVISION);
+        }
+        pulseSubdivision = (int)D;
+
+        // Refrescar claves comprometidas con la subdivision final.
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
 
         RuleTable table;
         std::unordered_map<RuleKey, int, RuleKeyHash> keyOrder;
@@ -226,22 +285,45 @@ struct LSystemModule : Module {
             std::string t = trim(fieldTextCommitted[i]);
             if (t.empty()) continue;
             std::string err;
-            if (parseRuleLine(t, table, err) && fieldKeyCommittedValid[i]) {
+            if (parseRuleLine(t, table, err, pulseSubdivision) && fieldKeyCommittedValid[i]) {
                 keyOrder.emplace(fieldKeyCommitted[i], i);
                 keyFieldIndices[fieldKeyCommitted[i]].push_back(i);
             }
         }
 
-        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN};
+        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision};
+
+        // Pool 'r' de duraciones: racional -> subpulsos.
+        std::vector<WeightedPoolItem> durPool;
+        for (auto& e : rDurationPoolRational)
+            durPool.push_back(WeightedPoolItem(toSubpulses(e.num, e.den, pulseSubdivision), e.weight));
 
         std::lock_guard<std::mutex> lock(engineMutex);
+        bool subChanged = (oldSub != pulseSubdivision);
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+            engines[ch].setSubdivision(pulseSubdivision);
+            // Migrar el estado en curso a la unidad nueva ANTES de instalar
+            // las tablas: preserva la duracion real de la nota sonando y los
+            // matches de clave, evitando saltos audibles al editar en caliente.
+            engines[ch].migrateSubdivision(oldSub, pulseSubdivision);
             engines[ch].setRules(table);
             engines[ch].setKeyOrder(keyOrder);
             engines[ch].setKeyFieldIndices(keyFieldIndices);
             engines[ch].setInitiator(initKey);
             engines[ch].setFallback(fallback);
             engines[ch].setGradeRange(gradeMin, gradeMax);
+            engines[ch].setRandomDurationList(durPool);
+        }
+        if (subChanged) {
+            double r = (double)pulseSubdivision / (double)oldSub;
+            for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                if (ticksRemaining[ch] > 0)
+                    ticksRemaining[ch] = std::max(1,
+                        (int)llround((double)ticksRemaining[ch] * r));
+                // El paso de glide es por tick: si los ticks se hacen mas
+                // finos, cada paso se acorta para conservar el intervalo.
+                glideStepV[ch] *= (float)(1.0 / r);
+            }
         }
     }
 
@@ -259,7 +341,6 @@ struct LSystemModule : Module {
         cfg.listFieldMaxChars = LIST_FIELD_MAX_CHARS;
         cfg.gradeMin = gradeMin;
         cfg.gradeMax = gradeMax;
-        cfg.ppqn = PPQN;
 
         lgen::GeneratedRuleSet result =
             lgen::generateAll((lgen::GenStyle)genStyle, seedText, cfg);
@@ -277,6 +358,12 @@ struct LSystemModule : Module {
 
     
     // ---- Optional 'r' candidate lists -------------------------------------
+
+    // Pool 'r' de duraciones en forma racional (pulsos): num/den + peso. La
+    // conversion a subpulsos ocurre en recompileAll(), cuando ya se conocio
+    // la subdivision dinamica del set de reglas.
+    struct RationalPoolEntry { long long num; long long den; double weight; };
+    std::vector<RationalPoolEntry> rDurationPoolRational;
 
     // Splits an optional trailing ':weight' off a pool entry. Returns the
     // value part (trimmed) and sets weight (default 1.0 if no ':' present).
@@ -310,7 +397,7 @@ struct LSystemModule : Module {
         return !out.empty();
     }
 
-    static bool parseDurationCsv(const std::string& raw, std::vector<WeightedPoolItem>& out) {
+    static bool parseDurationCsv(const std::string& raw, std::vector<RationalPoolEntry>& out) {
         out.clear();
         std::string t = trim(raw);
         if (t.empty()) return true; // empty = unrestricted, not an error
@@ -319,9 +406,10 @@ struct LSystemModule : Module {
             if (part.empty()) continue;
             std::string valStr; double weight;
             if (!splitPoolWeight(part, valStr, weight)) return false;
-            int ticks;
-            if (!parseDurationTicks(valStr, ticks)) return false;
-            out.push_back({ticks, weight});
+            long long num = 0, den = 1;
+            if (!parseDurationPulses(valStr, num, den)) return false;
+            if (num <= 0) return false;
+            out.push_back({num, den, weight});
         }
         return !out.empty();
     }
@@ -338,11 +426,13 @@ struct LSystemModule : Module {
 
     void setRandomDurationListText(const std::string& text) {
         rDurationListText = text;
-        std::vector<WeightedPoolItem> parsed;
+        std::vector<RationalPoolEntry> parsed;
         rDurationListError = !parseDurationCsv(text, parsed);
         if (!rDurationListError) {
-            std::lock_guard<std::mutex> lock(engineMutex);
-            for (int ch = 0; ch < MAX_CHANNELS; ch++) engines[ch].setRandomDurationList(parsed);
+            // La subdivision puede cambiar si esta lista aporta denominadores
+            // nuevos: recompilar todo mantiene claves y pool coherentes.
+            rDurationPoolRational = parsed;
+            recompileAll();
         }
     }
 
@@ -365,7 +455,7 @@ struct LSystemModule : Module {
 
     void setAutoResetSteps(int steps) {
         autoResetSteps = steps;
-        for (int ch = 0; ch < MAX_CHANNELS; ch++) autoResetPulseCount[ch] = 0;
+        aasPulseCounter = 0;
     }
 
     void setScale(int idx) {
@@ -373,6 +463,9 @@ struct LSystemModule : Module {
         if (idx < 0 || idx >= (int)presets.size()) return;
         scaleIndex = idx;
         scale = presets[idx].semitones;
+        // La resolucion adaptativa del glide depende de la distancia en
+        // semitonos entre grados: recalcular con la escala nueva.
+        recompileAll();
     }
 
     void setRootNoteClass(int pitchClass) {
@@ -387,45 +480,24 @@ struct LSystemModule : Module {
             ticksRemaining[ch] = 0;
             gateHigh[ch] = false;
             retrigSamplesLeft[ch] = 0;
-            autoResetPulseCount[ch] = 0;
             gliding[ch] = false;
             evalTriggered[ch] = false;
         }
         activeField = -1;
-        // Restart aligned to the next clock edge (see awaitingClockAfterReset),
-        // and drop any stale oversized-gap candidate from before the reset.
+        // Restart aligned to the NEXT clock edge: the sequence stays silent
+        // until the incoming pulse arrives, so it lands exactly ON the beat
+        // (same alignment as anything else clocked from the same source).
         awaitingClockAfterReset = true;
-        pendingBeatSamples = 0.0;
+        aasPulseCounter = 0;
+        fracPos = 0.0;
+        nextBoundary = 1;
+        clockFrozen = false;
+        // Forget the detector's stale level: after this, only a genuine
+        // low->high transition of the clock line counts as a pulse.
+        clockTrigger.reset();
     }
 
-    void onInternalTick(const ProcessArgs& args, int ch, bool atPulse) {
-        // AAS (Autoreset After Steps): counts internal ticks (PPQN per beat),
-        // independent of the rule engine. 1 "step" = 1 beat = PPQN internal
-        // ticks. When the threshold is reached, this channel is reset exactly
-        // like a Reset pulse.
-        if (autoResetSteps > 0) {
-            autoResetPulseCount[ch]++;
-            if (autoResetPulseCount[ch] >= autoResetSteps * PPQN) {
-                autoResetPulseCount[ch] = 0;
-                {
-                    std::lock_guard<std::mutex> lock(engineMutex);
-                    engines[ch].reset();
-                }
-                ticksRemaining[ch] = 0;
-                gateHigh[ch] = false;
-                retrigSamplesLeft[ch] = 0;
-                gliding[ch] = false;
-                if (ch == 0) activeField = -1;
-                // Same contract as a Reset pulse: hold until the next clock
-                // edge so the restarted cycle lands exactly ON the beat --
-                // unless the threshold happened to land on the downbeat tick
-                // itself (the common case once starts are pulse-aligned):
-                // there no hold is needed and forcing one would mute a whole
-                // beat every cycle.
-                if (!atPulse) awaitingClockAfterReset = true;
-            }
-        }
-
+    void onInternalTick(const ProcessArgs& args, int ch) {
         if (ticksRemaining[ch] > 0) {
             if (gliding[ch]) currentPitch[ch] += glideStepV[ch];
             ticksRemaining[ch]--;
@@ -506,10 +578,9 @@ struct LSystemModule : Module {
             float originPitch = (note - 60) / 12.f;
 
             // 'Fake slide': instead of sample-accurate interpolation, step the
-            // pitch by a fixed amount on every clock pulse across this note's
-            // duration, assuming the standard 48-PPQN tick resolution already
-            // used throughout the engine. Coarser on wide intervals or slow
-            // clocks, but needs no clock-speed detection or per-sample DSP.
+            // pitch by a fixed amount on every internal subpulse across this
+            // note's duration. Coarser on wide intervals or slow clocks, but
+            // needs no clock-speed detection or per-sample DSP.
             if (ev.hasGlide && !ev.glideTarget.isRest) {
                 int targetNote = degreeToNote(ev.glideTarget.value, scale, rootNote);
                 float targetPitch = (targetNote - 60) / 12.f;
@@ -529,11 +600,10 @@ struct LSystemModule : Module {
         }
     }
 
-    // Fires one internal engine tick on every active channel. atPulse marks
-    // the tick generated by the incoming clock pulse itself (the downbeat).
-    void fireInternalTick(const ProcessArgs& args, bool atPulse) {
+    // Fires one internal engine tick on every active channel.
+    void fireInternalTick(const ProcessArgs& args) {
         for (int ch = 0; ch < numChannels; ch++) {
-            onInternalTick(args, ch, atPulse);
+            onInternalTick(args, ch);
         }
     }
 
@@ -576,19 +646,18 @@ struct LSystemModule : Module {
                         float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
                         // Per-channel: if a polyphonic channel is negative, reset it normally.
                         if (evalV < -1.0f) {
-                            engines[ch].resetTo(fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                            engines[ch].resetTo(fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision});
                             ticksRemaining[ch] = 0; gateHigh[ch] = false;
-                            retrigSamplesLeft[ch] = 0; autoResetPulseCount[ch] = 0;
+                            retrigSamplesLeft[ch] = 0;
                             gliding[ch] = false; evalTriggered[ch] = false;
                             continue;
                         }
                         int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
-                        RuleKey targetKey = fieldKeyCommittedValid[targetRow] ? fieldKeyCommitted[targetRow] : (fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                        RuleKey targetKey = fieldKeyCommittedValid[targetRow] ? fieldKeyCommitted[targetRow] : (fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision});
                         engines[ch].resetToField(targetRow, targetKey);
                         ticksRemaining[ch] = 0;
                         gateHigh[ch] = false;
                         retrigSamplesLeft[ch] = 0;
-                        autoResetPulseCount[ch] = 0;
                         gliding[ch] = false;
                         evalTriggered[ch] = false;
                         if (ch == 0) activeField = targetRow;
@@ -601,72 +670,66 @@ struct LSystemModule : Module {
             }
         }
 
-        // ---- Clock front-end: 1 PPQN in -> PPQN internal ticks out -------
+        // ---- Clock front-end: 1 pulso entrante -> D subpulsos internos ----
         sampleCounter++;
 
         if (isRunning && inputs[CLOCK_INPUT].isConnected()) {
             if (clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
-                // Incoming beat pulse: re-anchor the internal beat boundary
-                // here and fire its downbeat tick immediately, so the sequence
-                // still starts on the very first clock pulse (as it always
-                // did). Sub-beat interpolation becomes available from the
-                // second pulse on, once a full beat has been measured.
-                double gap = (lastPulseSamplePos >= 0)
-                    ? double(sampleCounter - lastPulseSamplePos) : 0.0;
-                double prevBeat = samplesPerTick * (double)PPQN;
-
-                if (!haveClockTempo) {
-                    if (gap >= (double)CLOCK_MIN_BEAT_SAMPLES) {
-                        samplesPerTick = gap / (double)PPQN;
-                        haveClockTempo = true;
-                        pendingBeatSamples = 0.0;
-                    }
-                } else if (gap >= (double)CLOCK_MIN_BEAT_SAMPLES &&
-                           gap <= prevBeat * CLOCK_GAP_ADOPT_RATIO) {
-                    // Normal case (stable clock, moderate tempo moves):
-                    // adopt the fresh measurement directly.
-                    samplesPerTick = gap / (double)PPQN;
-                    pendingBeatSamples = 0.0;
-                } else if (gap > prevBeat * CLOCK_GAP_ADOPT_RATIO) {
-                    // Oversized gap: either a transport pause/resume or an
-                    // abrupt big slowdown. A single such gap is not trusted
-                    // (adopting it would drag one whole beat after every
-                    // pause); it is adopted only when the next gap confirms
-                    // a similar spacing.
-                    if (pendingBeatSamples > 0.0 &&
-                        std::abs(gap - pendingBeatSamples) <= pendingBeatSamples * CLOCK_GAP_CONFIRM_TOL) {
-                        samplesPerTick = gap / (double)PPQN;
-                        pendingBeatSamples = 0.0;
-                    } else {
-                        pendingBeatSamples = gap;
+                // Flanco real del clock: anclar aqui el downbeat. El intervalo
+                // medido se adopta directamente (sin heuristicas); los gaps
+                // minusculos son glitches y se ignoran.
+                if (lastEdgeSamplePos >= 0) {
+                    double gap = double(sampleCounter - lastEdgeSamplePos);
+                    if (!haveClockTempo) {
+                        if (gap >= (double)CLOCK_MIN_PULSE_SAMPLES) {
+                            samplesPerPulse = gap;
+                            haveClockTempo = true;
+                        }
+                    } else if (gap >= (double)CLOCK_MIN_PULSE_SAMPLES) {
+                        samplesPerPulse = gap;
                     }
                 }
-                // (gaps below CLOCK_MIN_BEAT_SAMPLES are glitches: keep tempo)
+                lastEdgeSamplePos = sampleCounter;
 
-                lastPulseSamplePos = sampleCounter;
-                clockFrozen = false;
-                tickPhase = 0.0;
+                // AAS: cuenta pulsos completos; el umbral cae justo en un
+                // flanco, asi que el ciclo reiniciado arranca alineado sin
+                // necesidad de esperar otro pulso.
+                if (autoResetSteps > 0 && ++aasPulseCounter >= autoResetSteps) {
+                    aasPulseCounter = 0;
+                    std::lock_guard<std::mutex> lock(engineMutex);
+                    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                        engines[ch].reset();
+                        ticksRemaining[ch] = 0;
+                        gateHigh[ch] = false;
+                        retrigSamplesLeft[ch] = 0;
+                        gliding[ch] = false;
+                        evalTriggered[ch] = false;
+                    }
+                    activeField = -1;
+                }
+
                 awaitingClockAfterReset = false;
-                fireInternalTick(args, true);
-            } else if (haveClockTempo && !awaitingClockAfterReset) {
-                // Between pulses: interpolate the remaining internal ticks of
-                // the current beat at the measured rate. Once the next pulse
-                // is overdue, freeze instead of free-running -- matching how
-                // a stopped clock used to suspend the sequence mid-note.
-                // While awaitingClockAfterReset is armed (just after a Reset)
-                // this whole branch is skipped: the sequence stays silent
-                // until the next real pulse re-anchors it exactly on the beat.
-                double dueAt = double(lastPulseSamplePos) + samplesPerTick * (double)PPQN;
-                if (double(sampleCounter) <= dueAt) {
-                    tickPhase += 1.0 / samplesPerTick;
-                    while (tickPhase >= 1.0) {
-                        tickPhase -= 1.0;
-                        fireInternalTick(args, false);
-                    }
-                    clockFrozen = false;
-                } else {
-                    clockFrozen = true;
+                clockFrozen = false;
+                // El flanco real re-ancla la fase: cualquier resto del pulso
+                // anterior es obsoleto (si se conservara, un flanco temprano
+                // dispararia un tick interior espureo justo tras el downbeat
+                // y congelaria el resto del pulso, estirando la nota actual).
+                fracPos = 0.0;
+                nextBoundary = 1;
+                fireInternalTick(args);
+            } else if (!awaitingClockAfterReset && !clockFrozen && haveClockTempo &&
+                       samplesPerPulse > 0.0) {
+                // Entre flancos: interpolar los limites interiores del pulso
+                // (subpulsos 1..D-1). Al llegar a 1.0 SIN flanco nuevo, congelar
+                // y esperar el flanco real -- el modulo nunca corre mas rapido
+                // que su clock y queda mudo si este se detiene.
+                fracPos += 1.0 / samplesPerPulse;
+                int D = pulseSubdivision;
+                while (nextBoundary < D && fracPos * (double)D >= (double)nextBoundary) {
+                    fireInternalTick(args);
+                    nextBoundary++;
                 }
+                if (fracPos >= 1.0) clockFrozen = true;
             }
         } else {
             // Clock unplugged or module stopped: never stay armed forever,
@@ -772,13 +835,17 @@ struct LSystemModule : Module {
         // the next two incoming pulses.
         haveClockTempo = false;
         clockFrozen = false;
-        pendingBeatSamples = 0.0;
-        tickPhase = 0.0;
-        lastPulseSamplePos = -1;
-        samplesPerTick = 0;
+        awaitingClockAfterReset = false;
+        fracPos = 0.0;
+        nextBoundary = 1;
+        lastEdgeSamplePos = -1;
+        samplesPerPulse = 0.0;
+        pulseSubdivision = 1;
+        aasPulseCounter = 0;
         sampleCounter = 0;
         rGradeListText.clear();
         rDurationListText.clear();
+        rDurationPoolRational.clear();
         rGradeListError = false;
         rDurationListError = false;
         seedText.clear();

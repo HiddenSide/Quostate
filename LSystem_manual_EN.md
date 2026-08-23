@@ -5,13 +5,13 @@ These random events can be constrained through 2 text inputs at the bottom of th
 
 The module is monophonic and polyphonic up to 6 independent voices, each running its own randomization logic for degrees, durations, and possible paths between rules.
 
-The module needs a clock signal at its Clock input to work. It expects 1 PPQN: one pulse per quarter note (one pulse = one beat). The module measures the time between pulses and subdivides each beat internally into 48 ticks, so all durations keep their exact musical meaning regardless of how slow the incoming clock is. Two consecutive pulses are needed before sub-beat timing is available; until then only the first tick of each beat fires. If a pulse arrives later than expected, the module holds its current state (pitch and gate freeze) instead of running on, exactly as when the clock stops.
+The module needs a clock signal at its Clock input to work. It expects 1 PPQN: one pulse per quarter note (one pulse = one beat). Every duration is expressed in pulses (see *Durations*), and the module derives its internal resolution automatically from the values you use: it subdivides each pulse into as many internal steps as the fractions in your rules and pools require. Timing is anchored to the incoming pulses themselves — every beat starts exactly on a real clock edge — so the sequence cannot drift relative to other modules clocked from the same source. Two consecutive pulses are needed before sub-beat timing is available; until then only the first step of each beat fires. If a pulse arrives later than expected, the module holds its current state (pitch and gate freeze) instead of running on, exactly as when the clock stops.
 
 Up to 7 rules can be added in their respective text fields.
 Each rule field accepts up to 50 characters.
 A rule field beginning with `--` is ignored.
 
-If a currently active rule is modified or rewritten, the changes won't take effect until it finishes playing, including all of its repetitions. This lets you edit rules without stopping playback. A rule entry is confirmed with Enter or when the text field loses focus. Focus is shown as a yellow highlight on the horizontal title bar of each rule. This bar turns red if the entered or modified rule contains a syntax error. It turns green whenever the module's first channel plays that rule.
+If a currently active rule is modified or rewritten, the changes won't take effect until it finishes playing, including all of its repetitions. This lets you edit rules without stopping playback. Edits that change the module's internal resolution (for example, adding a fractional duration to a rule or to a random pool) are applied just as smoothly: the step currently playing keeps its exact length in musical time, and the new resolution takes effect starting on the next clock pulse. A rule entry is confirmed with Enter or when the text field loses focus. Focus is shown as a yellow highlight on the horizontal title bar of each rule. This bar turns red if the entered or modified rule contains a syntax error. It turns green whenever the module's first channel plays that rule.
 
 The simplest format for specifying a rule is:
 Initiator (degree,duration), the pair of characters `->`, and the sequence in the form of degree,duration [space] degree,duration [space] degree,duration...
@@ -104,7 +104,7 @@ This input is similar and located next to Random pool for r (Degrees). These are
 ## Using the `^` operator (Glide):
 As you may have noticed, every step of a rule is separated from the next by a space. That space can be replaced with the `^` character whenever you want. This means the step to the left of `^` will glide — a linear pitch slide from its own degree toward the pitch of the step to its right. The glide's target step is left unaffected by it, unless that target is itself the start of another glide. The glide's duration equals the duration of the step that starts it. The glide has no effect if either the origin step or the target step is a silence (`s`).
 
-Glide is implemented as a stepped pitch slide: the V/Oct output moves once per internal tick (48 ticks per incoming clock pulse). It is linear over the step duration, but not sample-accurate.
+Glide is implemented as a stepped pitch slide: the V/Oct output moves once per internal step. Its resolution adapts automatically: whenever a glide is present the module uses at least 16 internal steps per pulse, and it increases that resolution (up to 96) when a wide jump over a short duration would otherwise be heard as audible stairs — aiming for roughly 25 cents or less per step, based on the interval size, the step's duration, and the current scale. It is linear over the step duration, but not sample-accurate.
 
 The `^` must sit directly against the step it modifies, with no space in between, in order to work. A space is fine on the other side, between `^` and the target step.
 
@@ -134,7 +134,7 @@ When used with `*N`, `=T` is applied independently to each repetition. For examp
 
 Each repetition will complete to `1` beat.
 
-If the accumulated time is already exactly a multiple of `T`, the step is kept as a one-tick routing step. If its degree is a note, it is silent; if it is `s`, it behaves as a one-tick rest.
+If the accumulated time is already exactly a multiple of `T`, the step is kept as a one-subpulse routing step. If its degree is a note, it is silent; if it is `s`, it behaves as a one-subpulse rest.
 
 `=T` can only be used in the production side of a rule, after `->`. It cannot be used as an initiator duration or inside `<...>` lists.
 
@@ -170,19 +170,19 @@ If a trigger arrives at the Reset input while Eval is connected, it performs an 
 If the Eval input receives a polyphonic signal, each channel can use its own Eval voltage. If it receives a monophonic signal, the first channel is used for all voices.
 
 ## Durations: allowed values and limits.
-Time unit: the module works internally in ticks, where 48 ticks = "1" (one beat/quarter note). The Clock input receives one pulse per beat (1 PPQN) and the module subdivides each measured beat into those 48 internal ticks. Everything you write as a duration is converted to ticks on that basis.
-Two accepted formats, in any step, initiator, `<>` list, or pool:
-Plain number (integer or decimal): represents a number of beats. 1 = 48 ticks, 2 = 96 ticks, 0.5 = 24 ticks, 0.25 = 12 ticks.
-Fraction N/D (both unsigned integers): 1/2 = 24 ticks, 3/4 = 36 ticks, 1/8 = 6 ticks.
-Minimum limit: any value that would round to less than 1 tick is automatically rounded up to 1 tick (the smallest possible duration, 1/48 of a beat).
-Maximum limit: 1,000,000 ticks (≈ 20,833 beats).
+Time unit: one clock pulse. A duration of `1` lasts exactly one incoming pulse; `1/2` half a pulse; `2` two pulses. Two accepted formats, in any step, initiator, `<>` list, or pool:
+Plain number (integer or decimal): represents a number of pulses (or fractions of one). 1 = one pulse, 2 = two pulses, 0.5 = half a pulse.
+Fraction N/D (both unsigned integers): 1/2 = half a pulse, 3/4 = three quarters of a pulse, 1/8 = one eighth of a pulse.
+
+Internally the module converts every duration to whole subpulses: it chooses a common subdivision per pulse equal to the least common multiple of all denominators used across rules and pools (capped at 96). Integer durations and typical fractions (1/2, 1/4, 1/3, 3/4, ...) map exactly onto that grid. Denominators above the cap are rounded to the closest representable value, and any value that would round to less than 1 subpulse is rounded up to 1 (the smallest possible duration).
+Maximum limit: 1,000,000 subpulses.
 These same format rules and limits apply exactly the same way to the values entered in the duration pool.
 
 Duration `0` works as a routing/skip marker. 
 If a step with duration `0` is not the very last step of the rule, it is omitted. 
-If it is the very last step, it is kept as a silent one-tick routing step, so its degree can still select the next rule.
+If it is the very last step, it is kept as a silent one-subpulse routing step, so its degree can still select the next rule.
 
-If `0` is used in the initiator of a rule, it becomes 1 tick.
+If `0` is used in the initiator of a rule, it becomes 1 subpulse.
 
 ## Context Menu Options:
 
@@ -194,7 +194,7 @@ If `0` is used in the initiator of a rule, it becomes 1 tick.
 
 **Eval input mode**: Selects how the `Eval` input behaves: `Rule select (0-10V CV)` (queued or instant jump), `Loop / Hold rule (Gate)` (gate repeat), or `Advance on trigger (Trigger)` (stepped transitions).
 
-**Autoreset after steps**: Options to immediately reset the module after a certain number of beats (one step = one beat = one clock pulse). Selectable options: Off (default), 8, 16, 32, or 64 beats.
+**Autoreset after steps**: Options to automatically reset the module after a certain number of beats. The count follows the incoming clock pulses (one step = one pulse), so the restart always lands exactly on a beat, with the same timing as a manual Reset. Selectable options: Off (default), 8, 16, 32, or 64 beats.
 
 **Scale**: Allows selecting the scale to which the rule degrees will be quantized. Natural major scale by default.
 
@@ -202,7 +202,7 @@ If `0` is used in the initiator of a rule, it becomes 1 tick.
 
 **Random degree range(r)**: Allows selecting from various predefined limits within which `r` will pick its value if the [Random pool for r(Degrees)] input is empty. Also applies limits to the `'+'` and `-` operators. `-8 to 16` by default.
 
-**Randomize rules style**: Selects the generative profile used when generating rules with "Randomize Rules".
+**Randomize rules style**: Selects the generative profile used when generating rules with "Randomize Rules". *Melodic* favors singable contours (mostly stepwise motion, chord tones on phrase starts, a shared rhythmic cell per rule). *Acid/Techno* builds hypnotic loops around each rule's home degree, with weighted exits that keep rules chained to each other and bar-length completion via `=`. *Ambient* generates sparse, long gestures. *Complex Chaos* maximizes branching, random values, and rule hopping.
 
 **Randomize rules**: Randomizes all rules according to the chosen style. The seed input must be empty to generate a random seed, or it can be entered manually to repeat specific randomizations. e.g. (28222394, myseq1, etc.)
 Randomize Rules also generates the two `r` candidate pools according to the selected style.

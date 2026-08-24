@@ -206,16 +206,15 @@ struct MorphfastMini : Module {
 					if (delayRemaining <= 0)
 						startTransition();
 					break;
-				case ST_TRANSITION: {
-					completedPeriods++;
-					if (completedPeriods >= transSteps) {
-						finishTransition();
-					}
-					else if (curveIndex == STEP) {
-						outVoltage = snapInit + (snapTarget - snapInit)
-							* shape((float) completedPeriods / transSteps);
-					}
-				} break;
+case ST_TRANSITION: {
+                    completedPeriods++;
+                    if (completedPeriods >= transSteps) {
+                        finishTransition();
+                    }
+                    else if (curveIndex == STEP) {
+                        outVoltage = snapTarget;
+                    }
+                } break;
 				default:
 					break;
 			}

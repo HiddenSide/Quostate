@@ -1,8 +1,8 @@
 // RuleGenerator.hpp
-// Generador de reglas aleatorias para el módulo LSystem.
-// Extraído de LSystem.cpp para mantener el módulo principal enfocado
-// en runtime y UI. No depende del Module: recibe un GeneratorConfig
-// y devuelve un GeneratedRuleSet.
+// Random rule generator for the LSystem module.
+// Extracted from LSystem.cpp to keep the main module focused
+// on runtime and UI. Does not depend on Module: receives a GeneratorConfig
+// and returns a GeneratedRuleSet.
 #pragma once
 
 #include <string>
@@ -16,7 +16,7 @@
 namespace lgen {
 
 // =======================================================================
-// Tipos y configuración
+// Types and configuration
 // =======================================================================
 
 enum GenStyle {
@@ -38,12 +38,12 @@ struct GenProfile {
     float glideProb = 0.20f;
     float repeatProb = 0.30f;
     float branchExitProb = 0.35f;
-    // Duraciones candidatas como texto, en múltiplos/fracciones de UN PULSO
-    // de clock ("1" = un pulso completo, "1/4" = un cuarto de pulso).
+// Candidate durations as text, in multiples/fractions of ONE CLOCK PULSE
+// of clock ("1" = one full pulse, "1/4" = a quarter pulse).
     std::vector<const char*> durations;
 };
 
-// Parámetros del entorno que el generador necesita conocer.
+// Environment parameters that the generator needs to know.
 struct GeneratorConfig {
     int numFields = 7;
     int ruleFieldMaxChars = 50;
@@ -52,11 +52,11 @@ struct GeneratorConfig {
     int gradeMax = 16;
 };
 
-// Resultado completo de una generación.
+// Result of a complete generation.
 struct GeneratedRuleSet {
-    std::vector<std::string> rules;   // una entrada por campo de regla
-    std::string gradePool;            // texto para el pool de grados 'r'
-    std::string durationPool;         // texto para el pool de duraciones 'r'
+    std::vector<std::string> rules;   // one entry per rule field
+    std::string gradePool;            // text for the 'r' degree pool
+    std::string durationPool;         // text for the 'r' duration pool
 };
 
 // =======================================================================
@@ -127,8 +127,8 @@ inline GenProfile getProfileForStyle(GenStyle style) {
 // Seed
 // =======================================================================
 
-// Determinista para un mismo texto. Si seedText está vacío, genera uno
-// aleatorio y lo escribe de vuelta en seedText.
+// Deterministic for the same text. If seedText is empty, generates one
+// random and writes it back to seedText.
 inline uint32_t resolveSeed(std::string& seedText) {
     if (seedText.empty()) {
         std::random_device rd;
@@ -145,14 +145,14 @@ inline uint32_t resolveSeed(std::string& seedText) {
 }
 
 // =======================================================================
-// Generación de pools para 'r'
+// Pool generation for 'r'
 // =======================================================================
 
 inline void generatePools(std::mt19937& rng, GenStyle style,
                           const GeneratorConfig& cfg,
                           std::string& gradePoolOut,
                           std::string& durationPoolOut) {
-    // ---- 1. Pool de grados ----------------------------------------
+    // ---- 1. Degree pool ----------------------------------------
     std::vector<std::pair<int, int>> degCandidates;
     switch (style) {
         case STYLE_ACID_TECHNO:
@@ -183,7 +183,7 @@ inline void generatePools(std::mt19937& rng, GenStyle style,
     }
     gradePoolOut = dStr;
 
-    // ---- 2. Pool de duraciones ------------------------------------
+    // ---- 2. Duration pool ------------------------------------
     std::vector<std::pair<std::string, int>> durCandidates;
     switch (style) {
         case STYLE_ACID_TECHNO:
@@ -215,9 +215,9 @@ inline void generatePools(std::mt19937& rng, GenStyle style,
 }
 
 // =======================================================================
-// Generador genérico (Melodic / Ambient / Complex)
+// Generic generator (Melodic / Ambient / Complex)
 // =======================================================================
-// Topología: ciclo hamiltoniano + atajos probabilísticos (grafo ergódico).
+// Topology: Hamiltonian cycle + probabilistic shortcuts (ergodic graph).
 inline void generateRules(std::mt19937& rng, GenStyle style,
                           const GeneratorConfig& cfg,
                           std::vector<std::string>& rulesOut) {
@@ -225,10 +225,10 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 
     GenProfile prof = getProfileForStyle(style);
 
-    // ---- Iniciadores distintos arraigados en la escala -------------
+    // ---- Distinct initiators rooted in the scale -------------
     std::vector<int> degreeBase = {1, 3, 5, 2, 4, 7, 8, -2, 6, -1};
     std::vector<int> pickedGrades;
-    pickedGrades.push_back(1); // Rule 1 siempre es la tónica (grado 1)
+    pickedGrades.push_back(1); // Rule 1 is always the tonic (degree 1)
 
     std::vector<int> poolForRest(degreeBase.begin() + 1, degreeBase.end());
     std::shuffle(poolForRest.begin(), poolForRest.end(), rng);
@@ -262,12 +262,12 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
     std::uniform_int_distribution<int> stepsDist(prof.minSteps, prof.maxSteps);
     std::uniform_int_distribution<int> offsetDist(1, 2);
 
-    // ---- Contorno melódico -----------------------------------------
-    // Caminante de grados con pesos por intervalo: movimiento conjunto
-    // (-1/+1) favorecido sobre saltos, persistencia de direccion y
-    // recuperacion obligada tras un salto grande. El primer grado fijo del
-    // cuerpo se ajusta al tono de acorde (1/3/5/8) mas cercano, para que
-    // cada frase arranque consonante con la tonica.
+// ---- Melodic contour -----------------------------------------
+// Degree walker with interval weights: combined movement
+// (-1/+1) favored over jumps, persistence of direction and
+// mandatory recovery after a large jump. The first fixed degree
+// of the body is adjusted to the nearest chord tone (1/3/5/8),
+// so that each phrase starts consonant with the tonic.
     const int CHORD_TONES[4] = {1, 3, 5, 8};
     auto nearestChordTone = [&](int g) {
         int best = CHORD_TONES[0], bd = INT_MAX;
@@ -388,7 +388,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                     lastWasRest = false;
                 }
 
-                // Duración
+                // Duration
                 if (lastWasRest) {
                     dStr = uniRhythm ? uniDur : prof.durations[durDist(rng)];
                 } else if (pD < prof.rProb * 0.5f) {
@@ -418,11 +418,11 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                 }
             }
 
-            // Paso de enrutamiento de salida
+            // Output routing step
             int targetMain = cycleNext[i];
             std::string exitStep;
             if (prob(rng) < prof.branchExitProb && i != targetMain) {
-                int targetBranch = 0; // Atajo de vuelta a la tónica u otro tema
+                int targetBranch = 0; // Shortcut back to tonic or another theme
                 if (targetBranch == targetMain)
                     targetBranch = order[(i + 3) % cfg.numFields];
                 int gA = initiators[targetMain].grade;
@@ -445,7 +445,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
             }
             line += exitStep;
 
-            // Repetición *N
+            // Repetition *N
             if (prob(rng) < prof.repeatProb) {
                 int reps = (style == STYLE_AMBIENT || style == STYLE_ACID_TECHNO)
                     ? (prob(rng) < 0.5f ? 4 : 2) : 2;
@@ -476,11 +476,11 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 }
 
 // =======================================================================
-// Generador Acid / Techno
+// Acid / Techno generator
 // =======================================================================
-// Groove, repetición, loops hipnóticos y finalización de loop con '=T'.
-// Las reglas se encadenan entre sí mediante salidas ponderadas
-// hogar/destino: pegajosas pero con escape garantizado.
+// Groove, repetition, hypnotic loops and loop closure with '=T'.
+// Rules are chained together via weighted home/destination outputs:
+// sticky but with guaranteed escape.
 inline void generateAcidRules(std::mt19937& rng,
                               const GeneratorConfig& cfg,
                               std::vector<std::string>& rulesOut,
@@ -488,12 +488,12 @@ inline void generateAcidRules(std::mt19937& rng,
                               std::string& durationPoolOut) {
     rulesOut.assign(cfg.numFields, "");
 
-    // Pools fijos, afinados para acid.
+    // Fixed pools, tuned for acid.
     gradePoolOut = "1:6,5:3,3:2,8:2";
     durationPoolOut = "1/4:8,1/2:2";
 
-    // Detectar si la sintaxis de relleno '=T' está disponible.
-    // Si no, usar duraciones fijas de salida.
+// Detect if the fill syntax '=T' is available.
+// If not, use fixed output durations.
     bool canUseFill = false;
     {
         lsys::RuleTable testTable;
@@ -517,7 +517,7 @@ inline void generateAcidRules(std::mt19937& rng,
         }
         if ((int)grades.size() == cfg.numFields) break;
     }
-    // Si el rango de grados es muy pequeño, rellenar huecos.
+    // If the grade range is very small, fill gaps.
     for (int g = cfg.gradeMin;
          g <= cfg.gradeMax && (int)grades.size() < cfg.numFields; g++) {
         if (std::find(grades.begin(), grades.end(), g) == grades.end()) {
@@ -538,8 +538,8 @@ inline void generateAcidRules(std::mt19937& rng,
         cycleNext[order[i]] = order[(i + 1) % cfg.numFields];
     }
 
-    // ---- Patrones hipnóticos cortos --------------------------------
-    // H = grado "home" de esta regla. Cada patrón usa como mucho un 'r'.
+// ---- Short hypnotic patterns --------------------------------
+// H = "home" degree of this rule. Each pattern uses at most one 'r'.
     static const std::vector<std::vector<std::string>> patterns1 = {
         {"H", "H"},
         {"H", "H", "H"},
@@ -565,15 +565,15 @@ inline void generateAcidRules(std::mt19937& rng,
         int home = grades[i];
         std::string homeStr = std::to_string(home);
 
-        // La mayoría de las reglas acid quedan mejor en 1 beat.
-        // Algunas a 2 beats añaden variación de frase.
+// Most acid rules work better at 1 beat.
+// Some at 2 beats add phrase variation.
         std::string fillTarget = (prob(rng) < 0.70f) ? "1" : "2";
 
-        // Salida "pegajosa con escape": lista ponderada entre el propio hogar
-        // y el siguiente del ciclo. Los grados acid son únicos por campo, así
-        // que el grado identifica la regla destino sin ambigüedad aunque la
-        // duración de relleno no coincida con el LHS (rescate por grado del
-        // motor). Tónica 50/50; resto ~33% quedarse / ~67% avanzar.
+// Sticky output with escape": weighted list between home and
+// the next in the cycle. Acid degrees are unique per field, so
+// the degree identifies the destination rule unambiguously although
+// the fill duration may not match the LHS (rescue by degree of the
+// motor). Tonic 50/50; rest ~33% stay / ~67% advance.
         int fwdRule = cycleNext[i];
         int targetGrade = grades[fwdRule];
         int gSelf = home;
@@ -615,9 +615,9 @@ inline void generateAcidRules(std::mt19937& rng,
                 }
             }
 
-            // Paso de salida.
-            // Si '=T' está disponible, completa el loop y enruta por grado
-            // (lista ponderada hogar/destino); si no, duración fija 1/4.
+// Exit step.
+// If '=T' is available, completes the loop and routes by degree
+// (weighted home/destination list); if not, fixed duration 1/4.
             std::string exitGrades = twoWay
                 ? "<" + homeStr + ":" + std::to_string(wSelf) + "," +
                   std::to_string(targetGrade) + ":" + std::to_string(wFwd) + ">"
@@ -630,8 +630,8 @@ inline void generateAcidRules(std::mt19937& rng,
             }
             line += exitStep;
 
-            // Repeticiones: largas para el groove, pero sin enterrar la
-            // progresión del ciclo.
+// Repetitions: long for the groove, but without burying the
+// progression of the cycle.
             int reps;
             float pr = prob(rng);
             if (fillTarget == "1") reps = (pr < 0.30f) ? 4 : 8;
@@ -664,11 +664,10 @@ inline void generateAcidRules(std::mt19937& rng,
     }
 }
 
+// Main orchestrator
 // =======================================================================
-// Orquestador principal
-// =======================================================================
-// Punto de entrada único para el módulo: resuelve el seed, genera pools
-// y reglas según el estilo, y devuelve todo en un GeneratedRuleSet.
+// Entry point for the module: resolves the seed, generates pools
+// and rules according to style, and returns everything in a GeneratedRuleSet.
 inline GeneratedRuleSet generateAll(GenStyle style,
                                     std::string& seedText,
                                     const GeneratorConfig& cfg) {

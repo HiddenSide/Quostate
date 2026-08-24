@@ -26,7 +26,7 @@ inline int floorMod(int a, int b) {
 }
 
 // ---------------------------------------------------------------------
-// Límites y aritmética de duraciones
+// Limits and duration arithmetic
 // ---------------------------------------------------------------------
 
 // Sane ceilings for anything the user can type as a plain literal (grade
@@ -38,16 +38,16 @@ constexpr int MAX_USER_INT = 100000;
 constexpr int MAX_REPEAT_COUNT = 256;
 constexpr int MAX_TICKS = 1000000; // tope de subpulsos por evento
 
-// Máxima subdivisión interna por pulso: es el MCM de los denominadores
-// presentes en el set de reglas y pools, con este tope para acotar la tasa
-// de eventos internos.
+// Maximum internal subdivision per pulse: it's the LCM of the denominators
+// present in the rule set and pools, with this cap to limit the rate
+// of internal events.
 constexpr int MAX_SUBDIVISION = 96;
 
-// Resolución mínima del 'fake slide' (símbolos unidos por '^'): el pitch
-// avanza un escalón por subpulso interno, así que sin subdivision suficiente
-// el intervalo completo se salta en un solo tick (salto instantáneo).
+// Minimum resolution of the 'fake slide' (symbols joined by '^'): the pitch
+// advances one step per internal subpulse, so without sufficient subdivision
+// the full interval is skipped in a single tick (instant jump).
 constexpr int GLIDE_MIN_SUBDIVISION = 16;
-constexpr double GLIDE_STEPS_PER_SEMITONE = 4.0; // ≈25 cents por escalón
+constexpr double GLIDE_STEPS_PER_SEMITONE = 4.0; // ≈25 cents per step
 
 inline long long gcdLL(long long a, long long b) {
     if (a < 0) a = -a;
@@ -56,9 +56,9 @@ inline long long gcdLL(long long a, long long b) {
     return a > 0 ? a : 1;
 }
 
-// Convierte una duración racional (num/den PULSOS) a subpulsos enteros para
-// una subdivisión dada: redondeo al más cercano, mínimo 1 si num > 0, y 0
-// solo cuando num == 0. Nunca excede MAX_TICKS.
+// Converts a rational duration (num/den PULSES) to integer subpulses for
+// a given subdivision: rounded to nearest, minimum 1 if num > 0, and 0
+// only when num == 0. Never exceeds MAX_TICKS.
 inline int toSubpulses(long long num, long long den, int subdivision) {
     if (num <= 0 || den <= 0 || subdivision <= 0) return 0;
     long long v = llround((double)num * (double)subdivision / (double)den);
@@ -68,7 +68,7 @@ inline int toSubpulses(long long num, long long den, int subdivision) {
 }
 
 // ---------------------------------------------------------------------
-// Tipos básicos
+// Basic types
 // ---------------------------------------------------------------------
 
 struct GradeValue {
@@ -99,8 +99,8 @@ struct RuleKey {
 // A dequeued, playable event. Carries the RuleKey (grade+duration, used for
 // audio output and for chaining to the next rule) plus an optional pitch-glide
 // target: a 'fake slide' realized as a fixed per-subpulse V/oct step (see
-// LSystemModule::onInternalTick). Durations are in subpulsos: partes enteras
-// del pulso de clock entrante según la subdivisión activa.
+// LSystemModule::onInternalTick). Durations are in subpulses: integer parts
+// of the incoming clock pulse according to the active subdivision.
 struct ResolvedEvent {
     RuleKey key;
     bool hasGlide = false;
@@ -154,15 +154,15 @@ struct WeightedPoolItem {
 
 struct DurationSpec {
     SpecKind kind = SpecKind::FIXED;
-    bool zeroMarker = false;      // true si este FIXED fue literalmente '0' (skip marker)
-    int num = 1, den = 1;         // FIXED crudo: num/den pulsos
-    int fillNum = 1, fillDen = 1; // FILL (=T) crudo: rellena hacia múltiplos de T pulsos
+    bool zeroMarker = false;      // true if this FIXED was literally '0' (skip marker)
+    int num = 1, den = 1;         // FIXED raw: num/den pulses
+    int fillNum = 1, fillDen = 1; // FILL (=T) raw: fills toward multiples of T pulses
     std::vector<WeightedDurationItem> items;
     int fixedTicks = 0;           // resuelto: subpulsos (finalize)
     int fillTargetTicks = 0;      // resuelto: subpulsos (finalize)
 
-    // Materializa los valores enteros en subpulsos para la subdivisión dada.
-    // Debe llamarse tras el parse y antes de que el motor use la spec.
+// Materializes integer values into subpulses for the given subdivision.
+// Must be called after parsing and before the engine uses the spec.
     void finalize(int subdivision) {
         fixedTicks = toSubpulses(num, den, subdivision);
         fillTargetTicks = toSubpulses(fillNum, fillDen, subdivision);
@@ -373,9 +373,9 @@ inline bool parseGradeSpec(const std::string& strRaw, GradeSpec& out) {
 inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
     std::string str = trim(strRaw);
 
-    // Fill duration: =T
-    // Completa el tiempo transcurrido dentro de la repetición hacia el
-    // múltiplo siguiente de T pulsos.
+// Fill duration: =T
+// Completes the elapsed time within the repetition toward the
+// next multiple of T pulses.
     if (!str.empty() && str.front() == '=') {
         std::string target = trim(str.substr(1));
         long long fn = 0, fd = 1;
@@ -460,9 +460,9 @@ inline bool parseDurationSpec(const std::string& strRaw, DurationSpec& out) {
     return true;
 }
 
-// Parsea una línea de regla. `subdivision` convierte las duraciones (en
-// pulsos) a subpulsos enteros; si `densOut` no es nulo, se le agregan los
-// denominadores encontrados (para calcular la subdivisión dinámica).
+// Parses a rule line. `subdivision` converts durations (in
+// pulses) to integer subpulses; if `densOut` is not null, it adds the
+// denominators found (to calculate the dynamic subdivision).
 inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::string& error,
                           int subdivision = 1, std::vector<long long>* densOut = nullptr) {
     std::string line = trim(lineRaw);
@@ -598,17 +598,17 @@ public:
     void setInitiator(RuleKey init) { initiator = init; }
     void setFallback(FallbackMode m) { fallback = m; }
     void setGradeRange(int mn, int mx) { gradeMin = mn; gradeMax = mx; }
-    // Subdivisión interna: subpulsos por pulso de clock (MCM de los
-    // denominadores del set de reglas). Todas las duraciones resueltas del
-    // motor se expresan en subpulsos.
+// Internal subdivision: subpulses per clock pulse (LCM of the
+// denominators of the rule set). All resolved durations of the
+// motor are expressed in subpulses.
     void setSubdivision(int s) { subdivision = std::max(1, s); }
     // Migracion suave de subdivision: reescala el estado EN CURSO (clave
     // actual, ultima clave disparada, eventos encolados y memorias 'k'/'l'
     // de duracion) de la unidad vieja a la nueva. Asi los cambios de D por
     // edicion en caliente no alteran las duraciones reales ni provocan
     // saltos audibles: la nota que esta sonando conserva su longitud en
-    // pulsos y las claves siguen coincidiendo con la tabla nueva. Las
-    // tablas/reglas llegan aparte, ya expresadas en la unidad nueva.
+// pulsos and keys remain matching with the new table. The
+// tables/rules arrive separately, already expressed in the new unit.
     void migrateSubdivision(int oldS, int newS) {
         if (oldS == newS || oldS < 1 || newS < 1) return;
         double r = (double)newS / (double)oldS;
@@ -1059,8 +1059,8 @@ private:
     std::vector<WeightedPoolItem> randomGradeList;    // optional restricted candidates for 'r' (grade)
     std::vector<WeightedPoolItem> randomDurationList; // optional restricted candidates for 'r' (duration), in subpulsos
 
-    // Pool interno de duraciones para 'r' sin lista definida: 1, 1/2, 2 y
-    // 1/4 de pulso, resueltos a subpulsos según la subdivisión activa.
+// Internal duration pool for 'r' when no list is defined: 1, 1/2, 2 and
+// 1/4 of a pulse, resolved to subpulses according to the active subdivision.
     static constexpr int BUILTIN_POOL_NUM[4] = {1, 1, 2, 1};
     static constexpr int BUILTIN_POOL_DEN[4] = {1, 2, 1, 4};
 

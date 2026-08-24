@@ -75,7 +75,7 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger runButtonTrigger;
     dsp::SchmittTrigger runInputTrigger;
 
-    // Configuración
+    // Configuration
     FallbackMode fallback = FallbackMode::LOOP_TO_INITIATOR;
     int gradeMin = -8, gradeMax = 16;
     int scaleIndex = 0;
@@ -98,7 +98,7 @@ struct LSystemModule : Module {
     bool rGradeListError = false;
     bool rDurationListError = false;
 
-    // Estado del motor polifónico
+    // Polyphonic engine state
     LSystemEngine engines[MAX_CHANNELS];
     std::mutex engineMutex;
 
@@ -154,10 +154,10 @@ struct LSystemModule : Module {
         configOutput(EOR_OUTPUT, "End of Rule Trigger");
         configOutput(RULE_OUTPUT, "Rule Number (0-10V)");
 
-        // Reglas de inicio: set validado (compila sin errores) que muestra todas
-        // las capacidades: iniciador, grados fijos, silencio, aleatorio simple,
-        // listas aleatorias ponderadas (grado y duración), k (recordar el último
-        // aleatorio), desplazamientos cromáticos +N/-N y repetición *N.
+// Initial rules: validated set (compiles without errors) that shows all
+// capabilities: initiator, fixed grades, silence, simple random,
+// weighted random lists (degree and duration), k (remembering the last
+// random), chromatic shifts +N/-N and repetition *N.
         fieldText[0] = "1,1 -> r,1/2 <3,5,7>,1/2";
         fieldText[1] = "3,1/2 -> k+2,1/4 k,1/4 1,1/2 *2";
         fieldText[2] = "5,1/2 -> <1:2,r:1>,1/2 k,k";
@@ -1275,7 +1275,7 @@ struct LSystemModuleWidget : ModuleWidget {
             addChild(tf);
         }
 
-        // Fila 8: valores restringidos opcionales para 'r' (vacío = comportamiento actual)
+        // Row 8: optional restricted values for 'r' (empty = current behavior)
         static const float poolRows[2][4] = {
             {4.572f, 87.614f, 47.022f, 5.841f},  // degrees
             {52.917f, 87.614f, 48.948f, 5.841f}, // durations
@@ -1315,12 +1315,12 @@ struct LSystemModuleWidget : ModuleWidget {
         addChild(titleFb);
 
 
-        // Botones (momentáneos, con luz propia solo en Run)
+        // Buttons (momentary, with light only on Run)
         addParam(createParamCentered<QuoButton>(mm2px(Vec(33.582f, 101.469f)), module, LSystemModule::RUN_PARAM));
         addChild(createLightCentered<QuoButtonLight<GreenLight>>(mm2px(Vec(33.500f, 101.400f)), module, LSystemModule::RUN_LIGHT));
         addParam(createParamCentered<QuoButton>(mm2px(Vec(21.378f, 101.469f)), module, LSystemModule::RESET_PARAM));
 
-        // Entradas / Salidas (posiciones exactas leídas de la capa Reference)
+        // Inputs / Outputs (exact positions read from the Reference layer)
         addInput(createInputCentered<QuoJack>(mm2px(Vec(9.173f, 110.839f)), module, LSystemModule::CLOCK_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(21.387f, 110.839f)), module, LSystemModule::RESET_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(33.576f, 110.839f)), module, LSystemModule::RUN_INPUT));

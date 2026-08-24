@@ -25,6 +25,7 @@ Whatever comes before `->` is not sequenced, it's used to label whether this rul
 Let's add a second rule to the example, in the second text field (or any other), which together with the first would look like:
 
 `(Rule 1:) 1,1->1,1 3,1/2 5,3 7,4`
+
 `(Rule 2:) 7,1->5,1 1,1`
 
 Now, since the final degree of the first rule matches the initiator degree of Rule 2, the sequence will continue into Rule 2 once the duration of the last degree (4, in this case) ends.
@@ -41,7 +42,7 @@ Rule matching order:
 4. If no rule has the same degree, the fallback option is applied (**If a note has no rule...** in context menu).
 
 
-## Using `r` (random), `k` (last random value) and `l` (random value in a list):
+## Using `r` (random), `k` (last random value) and `l` (last random value from a list):
 The character `r` can be used to specify a random value at any step of a rule: in the degree, the duration, or both at once. Every time `r` is evaluated, it takes a random value between predefined limits in the module's engine, if the corresponding pool is empty. Otherwise, it randomly picks one of the values specified in the pool. The two `r` pool fields accept up to 24 characters each.
 
 A character that complements `r` is `k`. When `k` is used in the degree, duration, or both, it takes the last value that `r` produced in that respective field — in the same rule or any previously executed rule — or defaults to 1 if `r` was never evaluated. Here:

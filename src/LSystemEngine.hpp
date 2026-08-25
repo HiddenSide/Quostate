@@ -138,8 +138,8 @@ struct WeightedDurationItem {
     bool isLastRandom = false; // 'k' inside a <...> list
     bool isLastList = false;   // 'l' inside a <...> list
     double weight = 1.0;
-    int num = 1, den = 1;      // pulsos crudos (parser): num/den
-    int ticks = 0;             // subpulsos resueltos (finalize)
+    int num = 1, den = 1;      // raw pulses (parser): num/den
+    int ticks = 0;             // resolved subpulses (finalize)
 };
 
 // A single entry in the 'r' candidate pools (LSystemModule's r-Degrees / r-Durations
@@ -158,8 +158,8 @@ struct DurationSpec {
     int num = 1, den = 1;         // FIXED raw: num/den pulses
     int fillNum = 1, fillDen = 1; // FILL (=T) raw: fills toward multiples of T pulses
     std::vector<WeightedDurationItem> items;
-    int fixedTicks = 0;           // resuelto: subpulsos (finalize)
-    int fillTargetTicks = 0;      // resuelto: subpulsos (finalize)
+    int fixedTicks = 0;           // resolved: subpulses (finalize)
+    int fillTargetTicks = 0;      // resolved: subpulses (finalize)
 
 // Materializes integer values into subpulses for the given subdivision.
 // Must be called after parsing and before the engine uses the spec.
@@ -470,7 +470,7 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
 
     size_t arrow = line.find("->");
     if (arrow == std::string::npos) {
-        error = "falta '->'";
+        error = "missing '->'";
         return false;
     }
     std::string left = trim(line.substr(0, arrow));
@@ -478,17 +478,17 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
 
     auto leftParts = splitTopLevel(left, ',');
     if (leftParts.size() != 2) {
-        error = "clave invalida (se esperaba 'grado,duracion')";
+        error = "Invalid key (expected 'degree, duration')";
         return false;
     }
     GradeValue keyGrade;
     long long keyNum = 0, keyDen = 1;
     if (!parseGradeValue(trim(leftParts[0]), keyGrade)) {
-        error = "grado de clave invalido";
+        error = "invalid key degree";
         return false;
     }
     if (!parseDurationPulses(trim(leftParts[1]), keyNum, keyDen)) {
-        error = "duracion de clave invalida";
+        error = "invalid key duration";
         return false;
     }
     if (densOut && keyNum > 0) densOut->push_back(keyDen);
@@ -521,7 +521,7 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
         if (!cur.empty()) { tokens.push_back(cur); tokenGlideNext.push_back(false); }
     }
     if (tokens.empty()) {
-        error = "produccion vacia";
+        error = "empty production";
         return false;
     }
 
@@ -530,12 +530,12 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
         if (tok.size() >= 2 && tok[0] == '*' &&
             std::all_of(tok.begin() + 1, tok.end(), [](char c) { return isdigit((unsigned char)c); })) {
             if (repeatCountSet) {
-                error = "solo se permite un operador *N por regla (ya se especifico uno antes de '" + tok + "')";
+                error = "Only one *N operator is allowed per rule (one was already specified before '" + tok + "')";
                 return false;
             }
             int rc;
             if (!parseBoundedInt(tok.substr(1), rc, MAX_REPEAT_COUNT)) {
-                error = "cantidad de repeticion invalida: '" + tok + "'";
+                error = "invalid repetition quantity: '" + tok + "'";
                 return false;
             }
             prod.repeatCount = std::max(1, rc);
@@ -544,16 +544,16 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
         }
         auto pair = splitTopLevel(tok, ',');
         if (pair.size() != 2) {
-            error = "simbolo invalido: '" + tok + "'";
+            error = "invalid symbol: '" + tok + "'";
             return false;
         }
         Symbol sym;
         if (!parseGradeSpec(pair[0], sym.grade)) {
-            error = "grado invalido: '" + pair[0] + "'";
+            error = "invalid degree: '" + pair[0] + "'";
             return false;
         }
         if (!parseDurationSpec(pair[1], sym.duration)) {
-            error = "duracion invalida: '" + pair[1] + "'";
+            error = "invaid duration: '" + pair[1] + "'";
             return false;
         }
         if (densOut) {
@@ -582,7 +582,7 @@ inline bool parseRuleLine(const std::string& lineRaw, RuleTable& table, std::str
 }
 
 // ---------------------------------------------------------------------
-// Motor L-system
+// L-system Engine
 // ---------------------------------------------------------------------
 
 class LSystemEngine {
@@ -602,13 +602,11 @@ public:
 // denominators of the rule set). All resolved durations of the
 // motor are expressed in subpulses.
     void setSubdivision(int s) { subdivision = std::max(1, s); }
-    // Migracion suave de subdivision: reescala el estado EN CURSO (clave
-    // actual, ultima clave disparada, eventos encolados y memorias 'k'/'l'
-    // de duracion) de la unidad vieja a la nueva. Asi los cambios de D por
-    // edicion en caliente no alteran las duraciones reales ni provocan
-    // saltos audibles: la nota que esta sonando conserva su longitud en
-// pulsos and keys remain matching with the new table. The
-// tables/rules arrive separately, already expressed in the new unit.
+    // Smooth subdivision migration: rescales the CURRENT state 
+    //(current key, last triggered key, queued events, and 'k'/'l' duration memories) from the old unit to the new one. 
+    //Thus, changes to D due to hot editing do not alter the actual durations or cause audible jumps: 
+    //the currently playing note retains its length in pulses, and keys remain matching the new table. 
+    //The tables/rules arrive separately, already expressed in the new unit.
     void migrateSubdivision(int oldS, int newS) {
         if (oldS == newS || oldS < 1 || newS < 1) return;
         double r = (double)newS / (double)oldS;
@@ -1055,9 +1053,9 @@ private:
     RuleKey initiator;
     FallbackMode fallback = FallbackMode::LOOP_TO_INITIATOR;
     int gradeMin = -8, gradeMax = 16;
-    int subdivision = 1; // subpulsos por pulso de clock (ver setSubdivision)
+    int subdivision = 1; // subpulses per clock pulse (see setSubdivision)
     std::vector<WeightedPoolItem> randomGradeList;    // optional restricted candidates for 'r' (grade)
-    std::vector<WeightedPoolItem> randomDurationList; // optional restricted candidates for 'r' (duration), in subpulsos
+    std::vector<WeightedPoolItem> randomDurationList; // optional restricted candidates for 'r' (duration), in subpulses
 
 // Internal duration pool for 'r' when no list is defined: 1, 1/2, 2 and
 // 1/4 of a pulse, resolved to subpulses according to the active subdivision.

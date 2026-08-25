@@ -60,7 +60,7 @@ struct GeneratedRuleSet {
 };
 
 // =======================================================================
-// Perfil por estilo
+// Profile by style
 // =======================================================================
 
 inline GenProfile getProfileForStyle(GenStyle style) {
@@ -246,7 +246,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
         initiators[i] = { pickedGrades[i], prof.durations[di] };
     }
 
-    // ---- Grafo dirigido: ciclo hamiltoniano ------------------------
+    // ---- Directed graph: Hamiltonian cycle ------------------------
     std::vector<int> order(cfg.numFields);
     for (int i = 0; i < cfg.numFields; i++) order[i] = i;
     std::shuffle(order.begin() + 1, order.end(), rng);
@@ -289,7 +289,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
         for (size_t k = 0; k < N; k++) {
             float w = base[k].w;
             if (std::abs(prevInt) >= 4 && std::abs(base[k].iv) > 2)
-                w = 0.f; // tras un salto, solo grados conjuntos (recuperacion)
+                w = 0.f; // after a jump, only joint degrees (recovery)
             if (dir != 0 && ((base[k].iv > 0) == (dir > 0)))
                 w *= 1.6f; // persistencia de direccion
             ws[k] = w;
@@ -315,14 +315,14 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
 
         while (!valid && attempts < 20) {
             attempts++;
-            // Estado del contorno y celula ritmica: frescos por intento para
-            // que cada linea candidata sea autosuficiente.
+            // State of the contour and rhythmic cell: fresh per attempt so that
+            // each candidate line is self-sufficient.
             int contourCur = initiators[i].grade;
             int contourDir = 0;
             int prevIntv = 0;
             bool snappedToChord = false;
-            // Celula ritmica del cuerpo: 45% unica duracion repetida (motivo
-            // hipnotico), 55% sorteos independientes (variacion).
+            // Body rhythmic cell: 45% single repeated duration (motif
+            // hypnotic), 55% independent draws (variation).
             bool uniRhythm = prob(rng) < 0.45f;
             std::string uniDur = prof.durations[durDist(rng)];
 
@@ -342,7 +342,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                 std::string gStr;
                 std::string dStr;
 
-                // Grado
+                // Degree
                 if (pG < prof.restProb && !lastWasRest && s > 0) {
                     gStr = "s";
                     lastWasRest = true;
@@ -374,8 +374,8 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                     listUsed = true;
                     lastWasRest = false;
                 } else {
-                    // Grado fijo: caminante de contorno. El primer grado fijo
-                    // de la frase se ajusta al tono de acorde mas cercano.
+                    // Fixed degree: contour walker. The first fixed degree
+                    // of the phrase adjusts to the nearest chord pitch.
                     if (!snappedToChord) {
                         contourCur = nearestChordTone(contourCur);
                         snappedToChord = true;
@@ -410,7 +410,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                 glideFlags.push_back(canGlide);
             }
 
-            // Ensamblar pasos
+            // Glide
             for (size_t s = 0; s < stepTokens.size(); s++) {
                 line += stepTokens[s];
                 if (s + 1 < stepTokens.size()) {
@@ -452,7 +452,7 @@ inline void generateRules(std::mt19937& rng, GenStyle style,
                 line += " *" + std::to_string(reps);
             }
 
-            // Validar longitud y sintaxis
+            // Validate length and syntax
             if (line.size() <= (size_t)cfg.ruleFieldMaxChars) {
                 lsys::RuleTable testTable;
                 std::string err;
@@ -505,7 +505,7 @@ inline void generateAcidRules(std::mt19937& rng,
         return std::max(cfg.gradeMin, std::min(cfg.gradeMax, g));
     };
 
-    // ---- Elegir grados acid, preferentemente distintos -------------
+   
     std::vector<int> grades;
     std::vector<int> preferred = {
         1, 5, 3, 8, 2, 7, -1, 4, 6, -2, 9, 11, 10, 12
@@ -517,7 +517,7 @@ inline void generateAcidRules(std::mt19937& rng,
         }
         if ((int)grades.size() == cfg.numFields) break;
     }
-    // If the grade range is very small, fill gaps.
+    // If the Degree range is very small, fill gaps.
     for (int g = cfg.gradeMin;
          g <= cfg.gradeMax && (int)grades.size() < cfg.numFields; g++) {
         if (std::find(grades.begin(), grades.end(), g) == grades.end()) {
@@ -528,7 +528,7 @@ inline void generateAcidRules(std::mt19937& rng,
         grades.push_back(grades.empty() ? 1 : grades.back());
     }
 
-    // ---- Columna vertebral de transiciones -------------------------
+    //-----------Transitions -------------------------
     std::vector<int> order(cfg.numFields);
     for (int i = 0; i < cfg.numFields; i++) order[i] = i;
     std::shuffle(order.begin() + 1, order.end(), rng);
@@ -597,7 +597,7 @@ inline void generateAcidRules(std::mt19937& rng,
                 bool curIsRest = (pattern[s] == "s");
                 bool nextIsRest = (s + 1 < pattern.size() && pattern[s + 1] == "s");
 
-                // Casi siempre 1/4. Para loops de 2 beats, a veces 1/2.
+                // Almost always 1/4. For 2-beat loops, sometimes 1/2.
                 std::string dur = "1/4";
                 if (fillTarget == "2" && !curIsRest && prob(rng) < 0.18f) {
                     dur = "1/2";
@@ -609,15 +609,15 @@ inline void generateAcidRules(std::mt19937& rng,
                     bool glide = !curIsRest && !nextIsRest && prob(rng) < 0.35f;
                     line += glide ? "^" : " ";
                 } else {
-                    // Glide opcional hacia el paso de salida/relleno.
+                    // Optional glide to the exit/fill step.
                     bool glideToExit = !curIsRest && prob(rng) < 0.25f;
                     line += glideToExit ? "^" : " ";
                 }
             }
 
-// Exit step.
-// If '=T' is available, completes the loop and routes by degree
-// (weighted home/destination list); if not, fixed duration 1/4.
+            // Exit step.
+            // If '=T' is available, completes the loop and routes by degree
+            // (weighted home/destination list); if not, fixed duration 1/4.
             std::string exitGrades = twoWay
                 ? "<" + homeStr + ":" + std::to_string(wSelf) + "," +
                   std::to_string(targetGrade) + ":" + std::to_string(wFwd) + ">"
@@ -630,8 +630,8 @@ inline void generateAcidRules(std::mt19937& rng,
             }
             line += exitStep;
 
-// Repetitions: long for the groove, but without burying the
-// progression of the cycle.
+            // Repetitions: long for the groove, but without burying the
+            // progression of the cycle.
             int reps;
             float pr = prob(rng);
             if (fillTarget == "1") reps = (pr < 0.30f) ? 4 : 8;
@@ -648,7 +648,7 @@ inline void generateAcidRules(std::mt19937& rng,
             }
         }
 
-        // Respaldo simple.
+        
         if (!valid) {
             std::string line = homeStr + ",1/4 -> " + homeStr + ",1/4 r,1/4 ";
             if (canUseFill) {

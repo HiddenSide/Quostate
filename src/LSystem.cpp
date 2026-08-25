@@ -29,7 +29,6 @@ struct LSystemModule : Module {
 
     static constexpr int NUM_FIELDS = 7;
     static constexpr int MAX_CHANNELS = 6;
-    // Global tunables for the two text-field character caps (per user testing).
     static constexpr int RULE_FIELD_MAX_CHARS = 50;
     static constexpr int LIST_FIELD_MAX_CHARS = 24;
 
@@ -108,26 +107,26 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger runTrigger;
 
     // ---- Clock front-end -------------------------------------------------
-    // El clock externo entrega UN pulso por negra. El motor corre en
-    // SUBPULSOS: cada pulso entrante se divide en 'pulseSubdivision' partes
-    // iguales (MCM dinamico de los denominadores presentes en las reglas y
-    // pools). Un paso "1" dura exactamente un pulso, "1/2" medio pulso y "2"
-    // dos pulsos. Los downbeats estan anclados al flanco real del pulso y el
-    // resto fraccional se arrastra entre pulsos (nunca se descarta), asi que
-    // la tasa promedio coincide siempre con el clock: sin deriva acumulativa.
-    static constexpr int64_t CLOCK_MIN_PULSE_SAMPLES = 64; // rechaza glitches
-    int pulseSubdivision = 1;        // subpulsos por pulso (recalculado al editar reglas)
-    double samplesPerPulse = 0.0;    // intervalo medido entre flancos, en muestras
-    int64_t lastEdgeSamplePos = -1;  // sampleCounter del ultimo flanco
-    double fracPos = 0.0;            // posicion [0..1+) dentro del pulso actual
-    int nextBoundary = 1;            // proximo limite interior del pulso (1..D-1)
-    bool haveClockTempo = false;     // falso hasta medir el primer intervalo completo
-    bool clockFrozen = false;        // flanco atrasado: retener hasta que llegue
+    // The external clock delivers ONE pulse per quarter note. The engine runs in
+    // SUBPULSES: each incoming pulse is divided into 'pulseSubdivision' equal parts
+    // (dynamic LCM of the denominators present in the rules and
+    // pools). A "1" step lasts exactly one pulse, "1/2" half a pulse, and "2"
+    // two pulses. Downbeats are anchored to the actual pulse edge, and the
+    // fractional remainder is carried over between pulses (never discarded), so
+    // the average rate always matches the clock: no cumulative drift.
+    static constexpr int64_t CLOCK_MIN_PULSE_SAMPLES = 64; // rejects glitches
+    int pulseSubdivision = 1;        // subpulses per pulse (recalculated when editing rules)
+    double samplesPerPulse = 0.0;    // measured interval between edges, in samples
+    int64_t lastEdgeSamplePos = -1;  // sampleCounter of the last edge
+    double fracPos = 0.0;            // position [0..1+) within the current pulse
+    int nextBoundary = 1;            // next inner limit of the pulse (1..D-1)
+    bool haveClockTempo = false;     // false until the first complete interval is measured
+    bool clockFrozen = false;        // delayed edge: hold until it arrives
     bool awaitingClockAfterReset = false;
-    int aasPulseCounter = 0;         // pulsos desde el ultimo autoreset (AAS)
-    int64_t sampleCounter = 0;       // incrementado una vez por frame de process()
+    int aasPulseCounter = 0;         // Pulses since the last autoress (AAS)
+    int64_t sampleCounter = 0;       // Incremented once per process() frame
     int ticksRemaining[MAX_CHANNELS] = {};
-    bool alignHold[MAX_CHANNELS] = {}; // retiene arranques hasta downbeat tras cambio de subdivision
+    bool alignHold[MAX_CHANNELS] = {}; // Holds starts until downbeat after subdivision change
     bool gateHigh[MAX_CHANNELS] = {};
     float currentPitch[MAX_CHANNELS] = {};
     int retrigSamplesLeft[MAX_CHANNELS] = {};
@@ -217,8 +216,8 @@ struct LSystemModule : Module {
         int oldSub = pulseSubdivision; // para migrar estado en curso si cambia
         for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
 
-        // Pass 1: recolectar denominadores de duraciones (reglas + pool 'r')
-        // para derivar la subdivision dinamica: MCM acotado por MAX_SUBDIVISION.
+        // Step 1: Collect denominators of durations (rules + pool 'r')
+        // To derive the dynamic subdivision: LCM bounded by MAX_SUBDIVISION.
         std::vector<long long> dens;
         RuleTable tmpTable;
         std::string tmpErr;
@@ -237,14 +236,15 @@ struct LSystemModule : Module {
             D = next;
         }
 
-        // Requisito de resolucion del glide ('^'): cada escalon no deberia
-        // superar ~25 cents. Para cada simbolo con glideToNext y objetivo
-        // predecible (grados FIXED audibles + duracion FIXED) se exige
-        // D >= ceil(delta_semitonos * pasos/semitono * den / num). Grados o
-        // duraciones aleatorias solo aportan el piso absoluto, porque su
-        // objetivo es impredecible en tiempo de compilacion. La fase se
-        // re-ancla en cada flanco real, asi que subir D no reintroduce deriva:
-        // solo anade fronteras interiores dentro del pulso.
+
+        // Glide resolution requirement ('^'): each step should not
+        // exceed ~25 cents. For each symbol with glideToNext and a predictable target
+        // (audible FIXED degrees + FIXED duration)
+        // D >= ceil(delta_semitones * steps/semitone * den / num) is required. Random degrees or
+        // durations only provide the absolute floor, because their
+        // target is unpredictable at compile time. The phase is
+        // re-anchored on each real edge, so raising D does not reintroduce drift:
+        // it only adds inner boundaries within the pulse.
         bool anyGlide = false;
         long long glideReq = 0;
         for (auto& kv : tmpTable) {
@@ -276,7 +276,7 @@ struct LSystemModule : Module {
         }
         pulseSubdivision = (int)D;
 
-        // Refrescar claves comprometidas con la subdivision final.
+        // Refresh keys committed to the final subdivision.
         for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
 
         RuleTable table;
@@ -294,7 +294,7 @@ struct LSystemModule : Module {
 
         RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision};
 
-        // Pool 'r' de duraciones: racional -> subpulsos.
+        // Pool 'r' of durations: rational -> subpulses.
         std::vector<WeightedPoolItem> durPool;
         for (auto& e : rDurationPoolRational)
             durPool.push_back(WeightedPoolItem(toSubpulses(e.num, e.den, pulseSubdivision), e.weight));
@@ -303,9 +303,9 @@ struct LSystemModule : Module {
         bool subChanged = (oldSub != pulseSubdivision);
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
             engines[ch].setSubdivision(pulseSubdivision);
-            // Migrar el estado en curso a la unidad nueva ANTES de instalar
-            // las tablas: preserva la duracion real de la nota sonando y los
-            // matches de clave, evitando saltos audibles al editar en caliente.
+        // Migrate the current state to the new drive BEFORE installing
+        // the tables: preserves the actual duration of the sounding note and the
+        // key matches, preventing audible jumps when editing on the fly.
             engines[ch].migrateSubdivision(oldSub, pulseSubdivision);
             engines[ch].setRules(table);
             engines[ch].setKeyOrder(keyOrder);
@@ -321,11 +321,11 @@ struct LSystemModule : Module {
                 if (ticksRemaining[ch] > 0)
                     ticksRemaining[ch] = std::max(1,
                         (int)llround((double)ticksRemaining[ch] * r));
-                // El paso de glide es por tick: si los ticks se hacen mas
-                // finos, cada paso se acorta para conservar el intervalo.
+                // The glide step is per tick: if the ticks become more 
+                // fine, each step is shortened to preserve the interval.
                 glideStepV[ch] *= (float)(1.0 / r);
-                // Cuantizar la transicion: el proximo evento arranca en el
-                // downbeat, no en un tick interior de la rejilla nueva.
+                // Quantize the transition: the next event starts on the
+                //downbeat, not on an inner tick of the new grid.
                 alignHold[ch] = true;
             }
         }
@@ -363,9 +363,9 @@ struct LSystemModule : Module {
     
     // ---- Optional 'r' candidate lists -------------------------------------
 
-    // Pool 'r' de duraciones en forma racional (pulsos): num/den + peso. La
-    // conversion a subpulsos ocurre en recompileAll(), cuando ya se conocio
-    // la subdivision dinamica del set de reglas.
+    // Pool 'r' of durations in rational form (pulses): num/den + weight. The
+    // conversion to subpulses occurs in recompileAll(), once the
+    // dynamic subdivision of the rule set is known.
     struct RationalPoolEntry { long long num; long long den; double weight; };
     std::vector<RationalPoolEntry> rDurationPoolRational;
 
@@ -433,8 +433,8 @@ struct LSystemModule : Module {
         std::vector<RationalPoolEntry> parsed;
         rDurationListError = !parseDurationCsv(text, parsed);
         if (!rDurationListError) {
-            // La subdivision puede cambiar si esta lista aporta denominadores
-            // nuevos: recompilar todo mantiene claves y pool coherentes.
+            // The subdivision may change if this list provides new denominators.
+            // Recompile everything to maintain consistent keys and pools.
             rDurationPoolRational = parsed;
             recompileAll();
         }
@@ -467,8 +467,8 @@ struct LSystemModule : Module {
         if (idx < 0 || idx >= (int)presets.size()) return;
         scaleIndex = idx;
         scale = presets[idx].semitones;
-        // La resolucion adaptativa del glide depende de la distancia en
-        // semitonos entre grados: recalcular con la escala nueva.
+        // The adaptive resolution of the glide depends on the distance in
+        // semitones between degrees: recalculate with the new scale.
         recompileAll();
     }
 
@@ -509,11 +509,12 @@ struct LSystemModule : Module {
             return;
         }
 
-        // Transicion de subdivision cuantizada al compas: si D cambio mientras
-        // esta nota sonaba, retener el ARRANQUE del siguiente evento hasta el
-        // proximo downbeat. Sin esto, un tick interior de la rejilla nueva
-        // dispararia el evento fuera de beat y desfasaria toda la secuencia
-        // respecto al clock hasta el proximo Reset.
+
+        // Quantized subdivision transition to the beat: if D changes while
+        // this note was playing, hold the START of the next event until the
+        // next downbeat. Without this, an inner tick of the new grid
+        // would trigger the off-beat event and push the entire sequence
+        // out of phase with the clock until the next Reset.
         if (!atPulse && alignHold[ch]) return;
         alignHold[ch] = false;
 
@@ -526,8 +527,8 @@ struct LSystemModule : Module {
                 float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
                 switch (evalMode) {
                     case EVAL_RULE_SELECT: {
-                        // Voltajes < -1V se tratan como "ignorar Eval": el L-System
-                        // continua su evaluacion natural, util con fuentes CV bipolares.
+                        // Voltages < -1V are treated as "ignore Eval": the L-System
+                        // continues its natural evaluation.
                         if (evalV >= -1.0f) {
                             int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
                             if (fieldKeyCommittedValid[targetRow]) {
@@ -684,14 +685,14 @@ struct LSystemModule : Module {
             }
         }
 
-        // ---- Clock front-end: 1 pulso entrante -> D subpulsos internos ----
+        // ---- Clock front-end: 1 incoming pulse -> D internal subpulses ----
         sampleCounter++;
 
         if (isRunning && inputs[CLOCK_INPUT].isConnected()) {
             if (clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
-                // Flanco real del clock: anclar aqui el downbeat. El intervalo
-                // medido se adopta directamente (sin heuristicas); los gaps
-                // minusculos son glitches y se ignoran.
+                // Real flank of the clock: anchor the downbeat here. The measured interval
+                // is adopted directly (without heuristics); the gaps
+                // are glitches and are ignored.
                 if (lastEdgeSamplePos >= 0) {
                     double gap = double(sampleCounter - lastEdgeSamplePos);
                     if (!haveClockTempo) {
@@ -705,9 +706,9 @@ struct LSystemModule : Module {
                 }
                 lastEdgeSamplePos = sampleCounter;
 
-                // AAS: cuenta pulsos completos; el umbral cae justo en un
-                // flanco, asi que el ciclo reiniciado arranca alineado sin
-                // necesidad de esperar otro pulso.
+                // AAS: counts complete pulses; the threshold falls right on a
+                // edge, so the restarted cycle starts aligned without
+                // needing to wait for another pulse.
                 if (autoResetSteps > 0 && ++aasPulseCounter >= autoResetSteps) {
                     aasPulseCounter = 0;
                     std::lock_guard<std::mutex> lock(engineMutex);
@@ -724,19 +725,19 @@ struct LSystemModule : Module {
 
                 awaitingClockAfterReset = false;
                 clockFrozen = false;
-                // El flanco real re-ancla la fase: cualquier resto del pulso
-                // anterior es obsoleto (si se conservara, un flanco temprano
-                // dispararia un tick interior espureo justo tras el downbeat
-                // y congelaria el resto del pulso, estirando la nota actual).
+                // Real edge re-anchors phase: any remainder of pulse 
+                //previous is obsolete (if preserved, an early edge 
+                // would trigger a spurious internal tick right after the downbeat 
+                // and would freeze the rest of the pulse, stretching the current note).
                 fracPos = 0.0;
                 nextBoundary = 1;
                 fireInternalTick(args, true);
             } else if (!awaitingClockAfterReset && !clockFrozen && haveClockTempo &&
                        samplesPerPulse > 0.0) {
-                // Entre flancos: interpolar los limites interiores del pulso
-                // (subpulsos 1..D-1). Al llegar a 1.0 SIN flanco nuevo, congelar
-                // y esperar el flanco real -- el modulo nunca corre mas rapido
-                // que su clock y queda mudo si este se detiene.
+                // Between edges: interpolate the inner limits of the pulse
+                // (subpulses 1..D-1). Upon reaching 1.0 WITHOUT a new edge, freeze
+                // and wait for the actual edge -- the module never runs faster
+                // than its clock and remains silent if the clock stops.
                 fracPos += 1.0 / samplesPerPulse;
                 int D = pulseSubdivision;
                 while (nextBoundary < D && fracPos * (double)D >= (double)nextBoundary) {
@@ -874,12 +875,7 @@ struct LSystemModule : Module {
 // WIDGET
 // =======================================================================
 
-// Fully custom text-field rendering: draws our own background (or none, for
-// a transparent field over the panel's own artwork), our own text color, and
-// a deterministically vertically-centered baseline (nvgTextAlign MIDDLE),
-// instead of relying on ui::TextField::draw()'s internal padding/positioning
-// -- which is what was causing text to clip out the bottom on short rows.
-// TUNE THESE to taste:
+
 static const NVGcolor QUO_FIELD_BG = nvgRGB(0x2a, 0x2a, 0x2a);   // dark gray fill; set alpha 0 (see below) for transparent
 static const NVGcolor QUO_FIELD_TEXT = nvgRGB(0xe8, 0xe8, 0xe8); // light/white text
 static const NVGcolor QUO_FIELD_CURSOR = nvgRGB(0xff, 0xcc, 0x30);
@@ -1222,19 +1218,10 @@ struct SeedTextField : ui::TextField {
 
 struct LSystemModuleWidget : ModuleWidget {
 
-
-
-
-    // All positions below come straight from the panel SVG's hidden
-    // "Reference" layer (jacks/buttons) and the rulesBack/rndDegressBack/
-    // rndDurationsBack rectangles (text fields), read directly out of the
-    // artwork so the code never has to eyeball pixel offsets against it.
     LSystemModuleWidget(LSystemModule* module) {
         setModule(module);
         setPanel(createPanel(asset::plugin(pluginInstance, "res/LSystem.svg")));
 
-
-        // Screws
         addChild(createWidget<ScrewBlack>(Vec(RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewBlack>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewBlack>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
@@ -1301,12 +1288,12 @@ struct LSystemModuleWidget : ModuleWidget {
             addChild(lf);
         }
 
-        //Texto de titulos separados en su svg para agregarlos a los ultimo y los overlay no lo tapen.
-        //Envuelto en un FramebufferWidget: igual que el panel, se renderiza a
-        //2x y se reescala, asi los trazados del texto se minifican suaves al
-        //alejar el zoom en vez de aliasar.
+        //Separate title text in your svg to add them to the last ones and the overlays do not cover it. 
+        //Wrapped in a FramebufferWidget: same as the panel, it renders to 
+        //2x and it is rescaled, so the text paths are minified smooth to the 
+        //zoom out instead of aliasing.
         widget::FramebufferWidget* titleFb = new widget::FramebufferWidget;
-        titleFb->oversample = 2.0; // sin esto (default 1.0 en Rack 2.x) aliasa al alejar el zoom
+        titleFb->oversample = 2.0;
         titleFb->box.pos = mm2px(Vec(0.0f, 0.0f));
         SvgWidget* titleText = new SvgWidget();
         titleText->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/RulesTitleText.svg")));
@@ -1315,12 +1302,12 @@ struct LSystemModuleWidget : ModuleWidget {
         addChild(titleFb);
 
 
-        // Buttons (momentary, with light only on Run)
+        // Buttons
         addParam(createParamCentered<QuoButton>(mm2px(Vec(33.582f, 101.469f)), module, LSystemModule::RUN_PARAM));
         addChild(createLightCentered<QuoButtonLight<GreenLight>>(mm2px(Vec(33.500f, 101.400f)), module, LSystemModule::RUN_LIGHT));
         addParam(createParamCentered<QuoButton>(mm2px(Vec(21.378f, 101.469f)), module, LSystemModule::RESET_PARAM));
 
-        // Inputs / Outputs (exact positions read from the Reference layer)
+        // Inputs / Outputs
         addInput(createInputCentered<QuoJack>(mm2px(Vec(9.173f, 110.839f)), module, LSystemModule::CLOCK_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(21.387f, 110.839f)), module, LSystemModule::RESET_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(33.576f, 110.839f)), module, LSystemModule::RUN_INPUT));
@@ -1329,8 +1316,7 @@ struct LSystemModuleWidget : ModuleWidget {
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(57.913f, 110.839f)), module, LSystemModule::RULE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(85.283f, 110.815f)), module, LSystemModule::GATE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(97.512f, 110.815f)), module, LSystemModule::PITCH_OUTPUT));
-        // Port/button labels ("Clk", "Rst", "Run", "V/Oct", "Gate", "EOR", "EOS")
-        // are baked into the panel art (insOutsText group) -- nothing to add here.
+        
     }
 
     void appendContextMenu(Menu* menu) override {
@@ -1425,8 +1411,8 @@ struct LSystemModuleWidget : ModuleWidget {
 
         menu->addChild(createSubmenuItem("Randomize rules style", "", [=](Menu* menu) {
             static const struct { const char* name; LSystemModule::GenStyle style; } styles[] = {
-                {"Melodic (Song Form)", LSystemModule::STYLE_MELODIC},
-                {"Acid / Techno / Polyrhythmic", LSystemModule::STYLE_ACID_TECHNO},
+                {"Melodic", LSystemModule::STYLE_MELODIC},
+                {"Acid / Techno", LSystemModule::STYLE_ACID_TECHNO},
                 {"Ambient / Evolving", LSystemModule::STYLE_AMBIENT},
                 {"Complex L-System", LSystemModule::STYLE_COMPLEX_CHAOS},
             };

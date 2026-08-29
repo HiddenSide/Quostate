@@ -153,19 +153,30 @@ struct LSystemModule : Module {
         configOutput(EOR_OUTPUT, "End of Rule Trigger");
         configOutput(RULE_OUTPUT, "Rule Number (0-10V)");
 
-// Initial rules: validated set (compiles without errors) that shows all
-// capabilities: initiator, fixed grades, silence, simple random,
-// weighted random lists (degree and duration), k (remembering the last
-// random), chromatic shifts +N/-N and repetition *N.
-        fieldText[0] = "1,1 -> r,1/2 <3,5,7>,1/2";
-        fieldText[1] = "3,1/2 -> k+2,1/4 k,1/4 1,1/2 *2";
-        fieldText[2] = "5,1/2 -> <1:2,r:1>,1/2 k,k";
-        fieldText[3] = "7,1/2 -> 8,1/4 7,1/4 5,1/2";
-        fieldText[4] = "8,1/4 -> k+1,1/4 k-1,1/4 s,1/4";
-        fieldText[5] = "s,1/2 -> 1,1/2";
-        fieldText[6] = "1,1/4 -> <2,4,6:2>,<1/4:2,1/8:1> k,k *2";
+// Initial rules: a long, mostly stable sequence with occasional wild
+// excursions. Rules 1..6 form a deterministic, anchored progression
+// (I -> III -> V -> II -> IV -> VI in the default Major scale) with short
+// motifs and heavy *N repetition, so the engine stays coherent and
+// predictable most of the time. Rule 7 is intentionally the unstable one:
+// short 1/8 notes, heavy use of r / lists containing r, and a small chance
+// to loop onto itself -- producing unpredictable bursts. Rule 6 branches
+// into rule 7 only ~20% of the time (weighted exit), so stability dominates
+// but the wild region is reached regularly.
+        fieldText[0] = "1,1 -> 1,1^3,1 5,1 3,1 1,1 3,1 *4";
+        fieldText[1] = "3,1 -> 3,1 5,1 <2,4,3>,1 5,1 5,1 *4";
+        fieldText[2] = "5,1 -> 5,1 7,1 4,1 5,1 <2:4,6>,1 *4";
+        fieldText[3] = "2,1 -> 2,1 4,1 1,1 6,1 <4,6>,1 *4";
+        fieldText[4] = "4,1 -> 4,1 6,1 2,1 3,1 6,1 *4";
+        fieldText[5] = "6,1 -> 6,1 1,1 3,1 5,1 <1:3,7:1>,1";
+        fieldText[6] = "7,1 -> r,1/2 <r,8>,1/4 k+2,r <1:3,8,r,7>,=2 *8";
 
         for (int i = 0; i < NUM_FIELDS; i++) fieldTextCommitted[i] = fieldText[i];
+
+// Default 'r' pools: keep the random degrees diatonic (so even the wild
+// rule 7 stays musical) and offer a spread of durations down to 1/8 for
+// the unstable bursts.
+        setRandomGradeListText("1,3,5,8,2,7");
+        setRandomDurationListText("1,1/2,1/4");
 
         recompileAll();
         resetAllEngines();

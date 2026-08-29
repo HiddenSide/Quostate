@@ -1,5 +1,13 @@
 # Changelog
 
+## Version: "2.2.1"
+
+**MorphfastMini STEP curve fixed**: the Step curve now interpolates from Init to
+  Target one step per clock pulse across the Duration, instead of jumping
+  straight to Target on the first clock edge. Easing shapes the height of each
+  step.
+
+
 ## Version: "2.2.0"
 
 **Added new module**: MorphfastMini.

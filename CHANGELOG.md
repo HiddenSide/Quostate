@@ -1,5 +1,13 @@
 # Changelog
 
+## Version: "2.2.2"
+
+**MorphfastMini LCD font load fixed**: the display font is now loaded inside the
+  draw callback instead of the widget constructor, so it stays valid when the
+  plugin editor window is reopened in a DAW host (new OpenGL context). Resolves
+  the VCV library pattern-check warning.
+
+
 ## Version: "2.2.1"
 
 **MorphfastMini STEP curve fixed**: the Step curve now interpolates from Init to

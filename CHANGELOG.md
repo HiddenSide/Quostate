@@ -4,6 +4,7 @@
 
 **Added new module**: MorphfastMini.
 
+**LSystem**:
 
 **Clock and timing model rewritten**: from "48 PPQN / fixed ticks" to
   "1 PPQN with automatic internal resolution" (subpulses = least common multiple

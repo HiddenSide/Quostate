@@ -212,7 +212,8 @@ case ST_TRANSITION: {
                         finishTransition();
                     }
                     else if (curveIndex == STEP) {
-                        outVoltage = snapTarget;
+                        float t = (float) completedPeriods / transSteps;
+                        outVoltage = snapInit + (snapTarget - snapInit) * shape(t);
                     }
                 } break;
 				default:

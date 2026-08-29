@@ -328,15 +328,14 @@ struct MorphButtonFire : SvgSwitch {
 // font height fitted exactly to the widget box height.
 struct LcdTextWidget : widget::Widget {
 	std::string text;
-	std::shared_ptr<window::Font> font;
+	std::string fontPath = asset::plugin(pluginInstance, "res/hd44780.otf");
 	MorphfastMini* module = NULL;
 
-	LcdTextWidget() {
-		font = APP->window->loadFont(asset::plugin(pluginInstance, "res/hd44780.otf"));
-	}
-
 	void draw(const DrawArgs& args) override {
-		if (text.empty() || !font)
+		if (text.empty())
+			return;
+		std::shared_ptr<window::Font> font = APP->window->loadFont(fontPath);
+		if (!font)
 			return;
 		nvgFontSize(args.vg, box.size.y);
 		nvgFontFaceId(args.vg, font->handle);

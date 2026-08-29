@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="4.4121337mm"
+   height="2.0288169mm"
+   viewBox="0 0 4.4121337 2.0288169"
+   version="1.1"
+   id="svg1"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <g
+     id="curve_ramp_back"
+     transform="translate(-0.67903131)">
+    <path
+       id="path73"
+       style="fill:#ffffff;fill-opacity:0.847645;stroke-width:0.105823;stroke-linecap:square;stroke-linejoin:round;stroke-dashoffset:0.468661;paint-order:stroke fill markers"
+       d="m 2.7140492,0 0.00129,0.33589681 H 3.0522658 L 3.0535558,0 H 3.0509796 2.716633 Z M 2.3771189,0.33848063 V 0.67437744 H 2.7140492 V 0.33848063 Z m 0.6764445,0 V 0.67437744 H 3.3904937 V 0.33848063 Z M 2.0376047,0.67747803 V 1.0133748 H 2.3745351 V 0.67747803 Z m 1.3554728,0 V 1.0133748 H 3.7300079 V 0.67747803 Z M 1.6980906,1.0159587 V 1.3518555 H 2.0350209 V 1.0159587 Z m 2.0345011,0 V 1.3518555 H 4.069522 V 1.0159587 Z M 1.3585764,1.3544393 V 1.6903361 H 1.6955067 V 1.3544393 Z m 2.7135295,0 V 1.6903361 H 4.4090362 V 1.3544393 Z M 0.67644749,1.6929199 v 0.3358968 z m 0.002584,0 V 2.0288167 H 1.0159616 V 1.6929199 Z m 0.34003091,0 V 2.0288167 H 1.3559926 V 1.6929199 Z m 3.3925578,0 V 2.0288167 H 4.7485504 V 1.6929199 Z m 0.3400309,0 V 2.0288167 H 5.0885813 V 1.6929199 Z m 0.3395142,0 v 0.3358968 z" />
+  </g>
+</svg>

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="10.5mm"
+   height="10.5mm"
+   viewBox="0 0 10.5 10.5"
+   version="1.1"
+   id="svg1"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1">
+    <linearGradient
+       xlink:href="#linearGradient134"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(0.88235355,0,0,0.88235514,-37.039481,-63.260746)"
+       x1="47.92799"
+       y1="72.129715"
+       x2="47.92799"
+       y2="83.160767"
+       id="linearGradient175_flat4553" />
+    <linearGradient
+       id="linearGradient134">
+      <stop
+         style="stop-color:#6f6f6f;stop-opacity:1;"
+         offset="0.11365929"
+         id="stop133" />
+      <stop
+         style="stop-color:#000000;stop-opacity:1;"
+         offset="1"
+         id="stop134" />
+    </linearGradient>
+  </defs>
+  <g
+     id="morphfastmini_knob_bg">
+    <path
+       id="circle172"
+       style="display:inline;fill:#2e2e2e;fill-opacity:1;stroke-width:0.336008;paint-order:stroke fill markers"
+       d="M 10.5 5.25006 A 5.25001 5.25 90 0 1 5.25005 10.5 A 5.25001 5.25 90 0 1 0 5.25006 A 5.25001 5.25 90 0 1 5.25005 0 A 5.25001 5.25 90 0 1 10.5 5.25006 Z" />
+    <path
+       id="circle173"
+       style="display:inline;fill:url(#linearGradient175_flat4553);stroke-width:0.311472;paint-order:stroke fill markers"
+       d="M 10.1166 5.25006 A 4.86665 4.86665 90 0 1 5.25005 10.1167 A 4.86665 4.86665 90 0 1 0.383372 5.25006 A 4.86665 4.86665 90 0 1 5.25005 0.383317 A 4.86665 4.86665 90 0 1 10.1166 5.25006 Z" />
+  </g>
+</svg>

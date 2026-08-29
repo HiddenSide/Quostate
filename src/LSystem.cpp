@@ -3,13 +3,19 @@
 #include "LSystemEngine.hpp"
 #include "MusicUtils.hpp"
 #include "components.hpp"
+#include "RuleGenerator.hpp"
 #include <mutex>
 #include <cmath>
 #include <random>
 #include <functional>
 #include <algorithm>
 
+
 using namespace lsys;
+
+// Definicion (C++11) de miembros static constexpr odr-used por el motor.
+constexpr int LSystemEngine::BUILTIN_POOL_NUM[4];
+constexpr int LSystemEngine::BUILTIN_POOL_DEN[4];
 
 // =======================================================================
 // MODULE
@@ -23,17 +29,16 @@ struct LSystemModule : Module {
 
     static constexpr int NUM_FIELDS = 7;
     static constexpr int MAX_CHANNELS = 6;
-    // Global tunables for the two text-field character caps (per user testing).
     static constexpr int RULE_FIELD_MAX_CHARS = 50;
     static constexpr int LIST_FIELD_MAX_CHARS = 24;
 
-    enum GenStyle {
-        STYLE_MELODIC = 0,
-        STYLE_ACID_TECHNO,
-        STYLE_AMBIENT,
-        STYLE_COMPLEX_CHAOS,
-        NUM_GEN_STYLES
-    };
+    using GenStyle = lgen::GenStyle;
+    static constexpr GenStyle STYLE_MELODIC = lgen::STYLE_MELODIC;
+    static constexpr GenStyle STYLE_ACID_TECHNO = lgen::STYLE_ACID_TECHNO;
+    static constexpr GenStyle STYLE_AMBIENT = lgen::STYLE_AMBIENT;
+    static constexpr GenStyle STYLE_COMPLEX_CHAOS = lgen::STYLE_COMPLEX_CHAOS;
+    static constexpr int NUM_GEN_STYLES = (int)lgen::NUM_GEN_STYLES;
+
     int genStyle = STYLE_MELODIC;
 
     enum EvalMode {
@@ -69,7 +74,7 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger runButtonTrigger;
     dsp::SchmittTrigger runInputTrigger;
 
-    // Configuración
+    // Configuration
     FallbackMode fallback = FallbackMode::LOOP_TO_INITIATOR;
     int gradeMin = -8, gradeMax = 16;
     int scaleIndex = 0;
@@ -77,8 +82,8 @@ struct LSystemModule : Module {
     int numChannels = 1;
     bool resetOnRun = true;
     // 0 = disabled: EOS fires only when the sequence "completes" (Rule 1, the
-    // initiator, fires again). >0: measured in raw CLOCK_INPUT pulses -- every
-    // (autoResetSteps * PPQN) clock pulses, this channel autoresets internally
+    // initiator, fires again). >0: measured in PULSES -- every (autoResetSteps)
+    // incoming clock pulses this channel autoresets internally
     // (equivalent to a Reset pulse, but with no cable-latency artifact) and
     // EOS fires only at that instant, decoupled from the rule engine entirely
     // so it can be used as a precise clock division for other modules.
@@ -92,7 +97,7 @@ struct LSystemModule : Module {
     bool rGradeListError = false;
     bool rDurationListError = false;
 
-    // Estado del motor polifónico
+    // Polyphonic engine state
     LSystemEngine engines[MAX_CHANNELS];
     std::mutex engineMutex;
 
@@ -101,11 +106,30 @@ struct LSystemModule : Module {
     dsp::SchmittTrigger resetButtonTrigger;
     dsp::SchmittTrigger runTrigger;
 
+    // ---- Clock front-end -------------------------------------------------
+    // The external clock delivers ONE pulse per quarter note. The engine runs in
+    // SUBPULSES: each incoming pulse is divided into 'pulseSubdivision' equal parts
+    // (dynamic LCM of the denominators present in the rules and
+    // pools). A "1" step lasts exactly one pulse, "1/2" half a pulse, and "2"
+    // two pulses. Downbeats are anchored to the actual pulse edge, and the
+    // fractional remainder is carried over between pulses (never discarded), so
+    // the average rate always matches the clock: no cumulative drift.
+    static constexpr int64_t CLOCK_MIN_PULSE_SAMPLES = 64; // rejects glitches
+    int pulseSubdivision = 1;        // subpulses per pulse (recalculated when editing rules)
+    double samplesPerPulse = 0.0;    // measured interval between edges, in samples
+    int64_t lastEdgeSamplePos = -1;  // sampleCounter of the last edge
+    double fracPos = 0.0;            // position [0..1+) within the current pulse
+    int nextBoundary = 1;            // next inner limit of the pulse (1..D-1)
+    bool haveClockTempo = false;     // false until the first complete interval is measured
+    bool clockFrozen = false;        // delayed edge: hold until it arrives
+    bool awaitingClockAfterReset = false;
+    int aasPulseCounter = 0;         // Pulses since the last autoress (AAS)
+    int64_t sampleCounter = 0;       // Incremented once per process() frame
     int ticksRemaining[MAX_CHANNELS] = {};
+    bool alignHold[MAX_CHANNELS] = {}; // Holds starts until downbeat after subdivision change
     bool gateHigh[MAX_CHANNELS] = {};
     float currentPitch[MAX_CHANNELS] = {};
     int retrigSamplesLeft[MAX_CHANNELS] = {};
-    int autoResetPulseCount[MAX_CHANNELS] = {}; // raw CLOCK_INPUT pulses since last autoreset
     bool gliding[MAX_CHANNELS] = {};
     float glideStepV[MAX_CHANNELS] = {}; // V/oct added to currentPitch on every clock pulse while gliding
     // 0-10V, linearly mapped across the 7 rule rows (Rule 1 = 0V ... Rule 7 = 10V),
@@ -120,7 +144,7 @@ struct LSystemModule : Module {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
         configParam(RUN_PARAM, 0.f, 1.f, 0.f, "Run");
         configParam(RESET_PARAM, 0.f, 1.f, 0.f, "Reset");
-        configInput(CLOCK_INPUT, "Clock (48 PPQN)");
+        configInput(CLOCK_INPUT, "Clock (1 pulse per quarter note)");
         configInput(RESET_INPUT, "Reset");
         configInput(RUN_INPUT, "Run Toggle (trigger)");
         configInput(EVAL_INPUT, "Eval");
@@ -129,19 +153,30 @@ struct LSystemModule : Module {
         configOutput(EOR_OUTPUT, "End of Rule Trigger");
         configOutput(RULE_OUTPUT, "Rule Number (0-10V)");
 
-        // Reglas de inicio: set validado (compila sin errores) que muestra todas
-        // las capacidades: iniciador, grados fijos, silencio, aleatorio simple,
-        // listas aleatorias ponderadas (grado y duración), k (recordar el último
-        // aleatorio), desplazamientos cromáticos +N/-N y repetición *N.
-        fieldText[0] = "1,1 -> r,1/2 <3,5,7>,1/2";
-        fieldText[1] = "3,1/2 -> k+2,1/4 k,1/4 1,1/2 *2";
-        fieldText[2] = "5,1/2 -> <1:2,r:1>,1/2 k,k";
-        fieldText[3] = "7,1/2 -> 8,1/4 7,1/4 5,1/2";
-        fieldText[4] = "8,1/4 -> k+1,1/4 k-1,1/4 s,1/4";
-        fieldText[5] = "s,1/2 -> 1,1/2";
-        fieldText[6] = "1,1/4 -> <2,4,6:2>,<1/4:2,1/8:1> k,k *2";
+// Initial rules: a long, mostly stable sequence with occasional wild
+// excursions. Rules 1..6 form a deterministic, anchored progression
+// (I -> III -> V -> II -> IV -> VI in the default Major scale) with short
+// motifs and heavy *N repetition, so the engine stays coherent and
+// predictable most of the time. Rule 7 is intentionally the unstable one:
+// short 1/8 notes, heavy use of r / lists containing r, and a small chance
+// to loop onto itself -- producing unpredictable bursts. Rule 6 branches
+// into rule 7 only ~20% of the time (weighted exit), so stability dominates
+// but the wild region is reached regularly.
+        fieldText[0] = "1,1 -> 1,1^3,1 5,1 3,1 1,1 3,1 *4";
+        fieldText[1] = "3,1 -> 3,1 5,1 <2,4,3>,1 5,1 5,1 *4";
+        fieldText[2] = "5,1 -> 5,1 7,1 4,1 5,1 <2:4,6>,1 *4";
+        fieldText[3] = "2,1 -> 2,1 4,1 1,1 6,1 <4,6>,1 *4";
+        fieldText[4] = "4,1 -> 4,1 6,1 2,1 3,1 6,1 *4";
+        fieldText[5] = "6,1 -> 6,1 1,1 3,1 5,1 <1:3,7:1>,1";
+        fieldText[6] = "7,1 -> r,1/2 <r,8>,1/4 k+2,r <1:3,8,r,7>,=2 *8";
 
         for (int i = 0; i < NUM_FIELDS; i++) fieldTextCommitted[i] = fieldText[i];
+
+// Default 'r' pools: keep the random degrees diatonic (so even the wild
+// rule 7 stays musical) and offer a spread of durations down to 1/8 for
+// the unstable bursts.
+        setRandomGradeListText("1,3,5,8,2,7");
+        setRandomDurationListText("1,1/2,1/4");
 
         recompileAll();
         resetAllEngines();
@@ -149,7 +184,7 @@ struct LSystemModule : Module {
 
     }
 
-    void recompileField(int idx) {
+    void recompileField(int idx, int subdiv) {
         fieldError[idx] = false;
         fieldErrorMsg[idx].clear();
         fieldKeyValid[idx] = false;
@@ -166,15 +201,15 @@ struct LSystemModule : Module {
 
         RuleTable tmp;
         std::string err;
-        if (parseRuleLine(t, tmp, err)) {
+        if (parseRuleLine(t, tmp, err, subdiv)) {
             auto arrow = t.find("->");
             auto leftParts = splitTopLevel(trim(t.substr(0, arrow)), ',');
             GradeValue g;
-            int ticks;
+            long long num = 0, den = 1;
             if (leftParts.size() == 2 &&
                 parseGradeValue(trim(leftParts[0]), g) &&
-                parseDurationTicks(trim(leftParts[1]), ticks)) {
-                fieldKey[idx] = RuleKey{g, ticks};
+                parseDurationPulses(trim(leftParts[1]), num, den)) {
+                fieldKey[idx] = RuleKey{g, toSubpulses(num, den, subdiv)};
                 fieldKeyValid[idx] = true;
             }
             // Valid: promote to committed, so the engine keeps using it even if
@@ -189,7 +224,71 @@ struct LSystemModule : Module {
     }
 
     void recompileAll() {
-        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i);
+        int oldSub = pulseSubdivision; // para migrar estado en curso si cambia
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
+
+        // Step 1: Collect denominators of durations (rules + pool 'r')
+        // To derive the dynamic subdivision: LCM bounded by MAX_SUBDIVISION.
+        std::vector<long long> dens;
+        RuleTable tmpTable;
+        std::string tmpErr;
+        for (int i = 0; i < NUM_FIELDS; i++) {
+            std::string t = trim(fieldTextCommitted[i]);
+            if (t.empty()) continue;
+            parseRuleLine(t, tmpTable, tmpErr, 1, &dens);
+        }
+        for (auto& e : rDurationPoolRational) dens.push_back(e.den);
+        long long D = 1;
+        for (long long d : dens) {
+            if (d <= 1) continue;
+            long long g = gcdLL(D, d);
+            long long next = D / g * d;
+            if (next > MAX_SUBDIVISION) continue;
+            D = next;
+        }
+
+
+        // Glide resolution requirement ('^'): each step should not
+        // exceed ~25 cents. For each symbol with glideToNext and a predictable target
+        // (audible FIXED degrees + FIXED duration)
+        // D >= ceil(delta_semitones * steps/semitone * den / num) is required. Random degrees or
+        // durations only provide the absolute floor, because their
+        // target is unpredictable at compile time. The phase is
+        // re-anchored on each real edge, so raising D does not reintroduce drift:
+        // it only adds inner boundaries within the pulse.
+        bool anyGlide = false;
+        long long glideReq = 0;
+        for (auto& kv : tmpTable) {
+            for (auto& prod : kv.second) {
+                size_t n = prod.symbols.size();
+                for (size_t i = 0; i + 1 < n; i++) {
+                    const Symbol& s = prod.symbols[i];
+                    if (!s.glideToNext) continue;
+                    anyGlide = true;
+                    if (s.duration.kind != SpecKind::FIXED || s.duration.num <= 0) continue;
+                    if (i + 1 >= prod.symbols.size()) continue;
+                    const Symbol& nxt = prod.symbols[i + 1];
+                    if (s.grade.kind != SpecKind::FIXED || nxt.grade.kind != SpecKind::FIXED) continue;
+                    const GradeValue& a = s.grade.fixedValue;
+                    const GradeValue& b = nxt.grade.fixedValue;
+                    if (a.isRest || b.isRest) continue;
+                    double semi = std::abs(degreeToNote(b.value, scale, rootNote) -
+                                           degreeToNote(a.value, scale, rootNote));
+                    if (semi <= 0.0) continue;
+                    long long req = (long long)std::ceil(semi * GLIDE_STEPS_PER_SEMITONE *
+                                                         (double)s.duration.den / (double)s.duration.num);
+                    if (req > glideReq) glideReq = req;
+                }
+            }
+        }
+        if (anyGlide) {
+            D = std::max(D, std::min(glideReq, (long long)MAX_SUBDIVISION));
+            D = std::max(D, (long long)GLIDE_MIN_SUBDIVISION);
+        }
+        pulseSubdivision = (int)D;
+
+        // Refresh keys committed to the final subdivision.
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
 
         RuleTable table;
         std::unordered_map<RuleKey, int, RuleKeyHash> keyOrder;
@@ -198,382 +297,88 @@ struct LSystemModule : Module {
             std::string t = trim(fieldTextCommitted[i]);
             if (t.empty()) continue;
             std::string err;
-            if (parseRuleLine(t, table, err) && fieldKeyCommittedValid[i]) {
+            if (parseRuleLine(t, table, err, pulseSubdivision) && fieldKeyCommittedValid[i]) {
                 keyOrder.emplace(fieldKeyCommitted[i], i);
                 keyFieldIndices[fieldKeyCommitted[i]].push_back(i);
             }
         }
 
-        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN};
+        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision};
+
+        // Pool 'r' of durations: rational -> subpulses.
+        std::vector<WeightedPoolItem> durPool;
+        for (auto& e : rDurationPoolRational)
+            durPool.push_back(WeightedPoolItem(toSubpulses(e.num, e.den, pulseSubdivision), e.weight));
 
         std::lock_guard<std::mutex> lock(engineMutex);
+        bool subChanged = (oldSub != pulseSubdivision);
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+            engines[ch].setSubdivision(pulseSubdivision);
+        // Migrate the current state to the new drive BEFORE installing
+        // the tables: preserves the actual duration of the sounding note and the
+        // key matches, preventing audible jumps when editing on the fly.
+            engines[ch].migrateSubdivision(oldSub, pulseSubdivision);
             engines[ch].setRules(table);
             engines[ch].setKeyOrder(keyOrder);
             engines[ch].setKeyFieldIndices(keyFieldIndices);
             engines[ch].setInitiator(initKey);
             engines[ch].setFallback(fallback);
             engines[ch].setGradeRange(gradeMin, gradeMax);
+            engines[ch].setRandomDurationList(durPool);
+        }
+        if (subChanged) {
+            double r = (double)pulseSubdivision / (double)oldSub;
+            for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                if (ticksRemaining[ch] > 0)
+                    ticksRemaining[ch] = std::max(1,
+                        (int)llround((double)ticksRemaining[ch] * r));
+                // The glide step is per tick: if the ticks become more 
+                // fine, each step is shortened to preserve the interval.
+                glideStepV[ch] *= (float)(1.0 / r);
+                // Quantize the transition: the next event starts on the
+                //downbeat, not on an inner tick of the new grid.
+                alignHold[ch] = true;
+            }
         }
     }
 
-    // ---- Rule randomization -------------------------------------------
-    // Deterministic given the same seed text: uses its OWN rng here, entirely
-    // separate from each LSystemEngine's runtime rng (which keeps resolving
-    // 'r'/'k' genuinely randomly during playback, completely unaffected).
 
+        // ---- Rule randomization -------------------------------------------
+    // Deterministic given the same seed text. The generation logic lives in
+    // RuleGenerator.hpp (namespace lgen); here we only feed it the module's
+    // config and apply the results back to the module state.
     std::string seedText; // shown/edited in the context menu; numeric or any string (hashed)
 
-    struct DurationChoice { int ticks; const char* text; };
-
-    struct GenProfile {
-        int minSteps = 2;
-        int maxSteps = 3;
-        float rProb = 0.35f;
-        float kProb = 0.25f;
-        float lProb = 0.15f;
-        float listProb = 0.25f;
-        float restProb = 0.12f;
-        float glideProb = 0.20f;
-        float repeatProb = 0.30f;
-        float branchExitProb = 0.35f;
-        std::vector<DurationChoice> durations;
-    };
-
-    static GenProfile getProfileForStyle(GenStyle style) {
-        GenProfile p;
-        switch (style) {
-            case STYLE_ACID_TECHNO:
-                p.minSteps = 2;
-                p.maxSteps = 3;
-                p.rProb = 0.35f;
-                p.kProb = 0.30f;
-                p.lProb = 0.15f;
-                p.listProb = 0.20f;
-                p.restProb = 0.18f;
-                p.glideProb = 0.35f;
-                p.repeatProb = 0.45f;
-                p.branchExitProb = 0.30f;
-                p.durations = {
-                    {PPQN / 4, "1/4"}, {PPQN / 8, "1/8"}, {PPQN / 2, "1/2"}, {PPQN / 3, "1/3"}
-                };
-                break;
-            case STYLE_AMBIENT:
-                p.minSteps = 1;
-                p.maxSteps = 2;
-                p.rProb = 0.40f;
-                p.kProb = 0.25f;
-                p.lProb = 0.20f;
-                p.listProb = 0.35f;
-                p.restProb = 0.08f;
-                p.glideProb = 0.30f;
-                p.repeatProb = 0.35f;
-                p.branchExitProb = 0.40f;
-                p.durations = {
-                    {PPQN, "1"}, {PPQN * 2, "2"}, {PPQN / 2, "1/2"}, {(PPQN * 3) / 4, "3/4"}
-                };
-                break;
-            case STYLE_COMPLEX_CHAOS:
-                p.minSteps = 2;
-                p.maxSteps = 3;
-                p.rProb = 0.40f;
-                p.kProb = 0.25f;
-                p.lProb = 0.20f;
-                p.listProb = 0.40f;
-                p.restProb = 0.15f;
-                p.glideProb = 0.25f;
-                p.repeatProb = 0.35f;
-                p.branchExitProb = 0.50f;
-                p.durations = {
-                    {PPQN / 4, "1/4"}, {PPQN / 2, "1/2"}, {PPQN, "1"}, {(PPQN * 3) / 4, "3/4"}, {PPQN / 3, "1/3"}
-                };
-                break;
-            case STYLE_MELODIC:
-            default:
-                p.minSteps = 2;
-                p.maxSteps = 3;
-                p.rProb = 0.35f;
-                p.kProb = 0.25f;
-                p.lProb = 0.15f;
-                p.listProb = 0.25f;
-                p.restProb = 0.12f;
-                p.glideProb = 0.20f;
-                p.repeatProb = 0.30f;
-                p.branchExitProb = 0.35f;
-                p.durations = {
-                    {PPQN / 4, "1/4"}, {PPQN / 2, "1/2"}, {PPQN, "1"}, {(PPQN * 3) / 4, "3/4"}
-                };
-                break;
-        }
-        return p;
-    }
-
-    uint32_t resolveSeed() {
-        if (seedText.empty()) {
-            std::random_device rd;
-            uint32_t s = rd();
-            seedText = std::to_string(s);
-            return s;
-        }
-        try {
-            unsigned long v = std::stoul(seedText);
-            return (uint32_t)(v & 0xFFFFFFFFu);
-        } catch (...) {
-            // Non-numeric seed text (e.g. a word): hash it into a seed
-            // instead of rejecting it, so any memorable string works too.
-            return (uint32_t)(std::hash<std::string>{}(seedText) & 0xFFFFFFFFu);
-        }
-    }
-
-    // Generates compact, weighted candidate pools for 'r' degrees and durations,
-    // tailored to the active musical style and strictly capped to LIST_FIELD_MAX_CHARS.
-    void randomizePools(std::mt19937& rng, GenStyle style) {
-        // 1. Degree Pool
-        std::vector<std::pair<int, int>> degCandidates;
-        switch (style) {
-            case STYLE_ACID_TECHNO:
-                degCandidates = {{1, 5}, {-3, 2}, {8, 3}, {3, 2}, {5, 2}, {-1, 1}};
-                break;
-            case STYLE_AMBIENT:
-                degCandidates = {{1, 4}, {3, 3}, {5, 3}, {7, 2}, {8, 2}, {10, 1}};
-                break;
-            case STYLE_COMPLEX_CHAOS:
-                degCandidates = {{1, 4}, {2, 2}, {3, 3}, {5, 3}, {7, 2}, {-2, 1}};
-                break;
-            case STYLE_MELODIC:
-            default:
-                degCandidates = {{1, 4}, {3, 3}, {5, 3}, {7, 2}, {8, 2}, {-2, 1}};
-                break;
-        }
-        std::shuffle(degCandidates.begin(), degCandidates.end(), rng);
-        std::string dStr;
-        for (size_t i = 0; i < degCandidates.size(); i++) {
-            int g = std::max(gradeMin, std::min(gradeMax, degCandidates[i].first));
-            int w = degCandidates[i].second;
-            std::string item = std::to_string(g) + (w > 1 ? ":" + std::to_string(w) : "");
-            if (!dStr.empty() && dStr.size() + 1 + item.size() > (size_t)LIST_FIELD_MAX_CHARS) break;
-            if (!dStr.empty()) dStr += ",";
-            dStr += item;
-        }
-        setRandomGradeListText(dStr);
-
-        // 2. Duration Pool
-        std::vector<std::pair<std::string, int>> durCandidates;
-        switch (style) {
-            case STYLE_ACID_TECHNO:
-                durCandidates = {{"1/4", 5}, {"1/8", 3}, {"1/2", 2}, {"1/3", 1}};
-                break;
-            case STYLE_AMBIENT:
-                durCandidates = {{"1", 4}, {"2", 2}, {"1/2", 3}, {"3/4", 1}};
-                break;
-            case STYLE_COMPLEX_CHAOS:
-                durCandidates = {{"1/4", 4}, {"1/2", 3}, {"1/3", 2}, {"1", 1}};
-                break;
-            case STYLE_MELODIC:
-            default:
-                durCandidates = {{"1/4", 4}, {"1/2", 3}, {"1", 2}, {"3/4", 1}};
-                break;
-        }
-        std::shuffle(durCandidates.begin(), durCandidates.end(), rng);
-        std::string tStr;
-        for (size_t i = 0; i < durCandidates.size(); i++) {
-            std::string item = durCandidates[i].first + (durCandidates[i].second > 1 ? ":" + std::to_string(durCandidates[i].second) : "");
-            if (!tStr.empty() && tStr.size() + 1 + item.size() > (size_t)LIST_FIELD_MAX_CHARS) break;
-            if (!tStr.empty()) tStr += ",";
-            tStr += item;
-        }
-        setRandomDurationListText(tStr);
-    }
-
-    // Fills fieldText[] with a freshly generated, self-consistent, and musically
-    // coherent rule set utilizing the full DSL syntax (r, k, l, ^, s, <>, *N, +N).
-    // Topology is built as an irreducible directed graph (Hamiltonian cycle backbone
-    // + probabilistic shortcut exits) guaranteeing ergodicity with no closed sub-loops.
-    void generateRandomRules(std::mt19937& rng, GenStyle style) {
-        randomizePools(rng, style);
-        GenProfile prof = getProfileForStyle(style);
-
-        // Pick 7 distinct initiators rooted in the musical scale
-        std::vector<int> degreeBase = {1, 3, 5, 2, 4, 7, 8, -2, 6, -1};
-        std::vector<int> pickedGrades;
-        pickedGrades.push_back(1); // Rule 1 is always tonic degree 1
-        std::vector<int> poolForRest(degreeBase.begin() + 1, degreeBase.end());
-        std::shuffle(poolForRest.begin(), poolForRest.end(), rng);
-        for (int i = 0; i < NUM_FIELDS - 1; i++) {
-            int g = std::max(gradeMin, std::min(gradeMax, poolForRest[i]));
-            pickedGrades.push_back(g);
-        }
-
-        std::uniform_int_distribution<int> durDist(0, (int)prof.durations.size() - 1);
-        struct InitiatorDef { int grade; int ticks; std::string durText; };
-        std::vector<InitiatorDef> initiators(NUM_FIELDS);
-        for (int i = 0; i < NUM_FIELDS; i++) {
-            int di = (i == 0) ? (prof.durations.size() > 1 ? 1 : 0) : durDist(rng);
-            initiators[i] = { pickedGrades[i], prof.durations[di].ticks, prof.durations[di].text };
-        }
-
-        // Directed graph: Hamiltonian cycle backbone
-        std::vector<int> order(NUM_FIELDS);
-        for (int i = 0; i < NUM_FIELDS; i++) order[i] = i;
-        std::shuffle(order.begin() + 1, order.end(), rng);
-
-        std::vector<int> cycleNext(NUM_FIELDS);
-        for (int i = 0; i < NUM_FIELDS; i++) {
-            int cur = order[i];
-            int nxt = order[(i + 1) % NUM_FIELDS];
-            cycleNext[cur] = nxt;
-        }
-
-        std::uniform_real_distribution<float> prob(0.f, 1.f);
-        std::uniform_int_distribution<int> stepsDist(prof.minSteps, prof.maxSteps);
-        std::uniform_int_distribution<int> offsetDist(1, 2);
-
-        for (int i = 0; i < NUM_FIELDS; i++) {
-            bool valid = false;
-            int attempts = 0;
-            std::string finalRule;
-
-            while (!valid && attempts < 20) {
-                attempts++;
-                std::string line = std::to_string(initiators[i].grade) + "," + initiators[i].durText + " -> ";
-
-                int numSteps = stepsDist(rng);
-                bool rUsed = false;
-                bool listUsed = false;
-                bool lastWasRest = false;
-
-                std::vector<std::string> stepTokens;
-                std::vector<bool> glideFlags;
-
-                for (int s = 0; s < numSteps; s++) {
-                    float pG = prob(rng);
-                    float pD = prob(rng);
-                    std::string gStr;
-                    std::string dStr;
-
-                    // Grade generation
-                    if (pG < prof.restProb && !lastWasRest && s > 0) {
-                        gStr = "s";
-                        lastWasRest = true;
-                    } else if (pG < prof.restProb + prof.rProb) {
-                        gStr = "r";
-                        rUsed = true;
-                        lastWasRest = false;
-                    } else if (rUsed && pG < prof.restProb + prof.rProb + prof.kProb) {
-                        if (prob(rng) < 0.4f) {
-                            int off = offsetDist(rng);
-                            gStr = "k+" + std::to_string(off);
-                        } else if (prob(rng) < 0.2f) {
-                            int off = offsetDist(rng);
-                            gStr = "k-" + std::to_string(off);
-                        } else {
-                            gStr = "k";
-                        }
-                        lastWasRest = false;
-                    } else if (listUsed && pG < prof.restProb + prof.rProb + prof.kProb + prof.lProb) {
-                        gStr = "l";
-                        lastWasRest = false;
-                    } else if (pG < prof.restProb + prof.rProb + prof.kProb + prof.lProb + prof.listProb) {
-                        int c1 = pickedGrades[rng() % pickedGrades.size()];
-                        int c2 = pickedGrades[rng() % pickedGrades.size()];
-                        if (c1 == c2) c2 = (c1 == 1 ? 5 : 1);
-                        gStr = "<" + std::to_string(c1) + "," + std::to_string(c2) + ">";
-                        listUsed = true;
-                        lastWasRest = false;
-                    } else {
-                        int delta = (int)(rng() % 5) - 2; // -2 to +2
-                        int val = std::max(gradeMin, std::min(gradeMax, initiators[i].grade + delta));
-                        gStr = std::to_string(val);
-                        lastWasRest = false;
-                    }
-
-                    // Duration generation
-                    if (lastWasRest) {
-                        dStr = prof.durations[durDist(rng)].text;
-                    } else if (pD < prof.rProb * 0.5f) {
-                        dStr = "r";
-                    } else if (rUsed && pD < (prof.rProb * 0.5f) + prof.kProb * 0.5f) {
-                        dStr = "k";
-                    } else if (pD < 0.25f && prof.durations.size() >= 2) {
-                        int di1 = rng() % prof.durations.size();
-                        int di2 = (di1 + 1) % prof.durations.size();
-                        dStr = "<" + std::string(prof.durations[di1].text) + "," + prof.durations[di2].text + ">";
-                    } else {
-                        dStr = prof.durations[durDist(rng)].text;
-                    }
-
-                    stepTokens.push_back(gStr + "," + dStr);
-                    bool canGlide = (!lastWasRest && s < numSteps - 1 && prob(rng) < prof.glideProb);
-                    glideFlags.push_back(canGlide);
-                }
-
-                // Assemble steps
-                for (size_t s = 0; s < stepTokens.size(); s++) {
-                    line += stepTokens[s];
-                    if (s + 1 < stepTokens.size()) {
-                        line += (glideFlags[s] ? "^" : " ");
-                    }
-                }
-
-                // Exit Routing Step
-                int targetMain = cycleNext[i];
-                std::string exitStep;
-
-                if (prob(rng) < prof.branchExitProb && i != targetMain) {
-                    int targetBranch = 0; // Shortcut back to tonic or another theme
-                    if (targetBranch == targetMain) targetBranch = order[(i + 3) % NUM_FIELDS];
-                    int gA = initiators[targetMain].grade;
-                    int gB = initiators[targetBranch].grade;
-                    if (gA != gB) {
-                        exitStep = "<" + std::to_string(gA) + ":3," + std::to_string(gB) + ":1>," + initiators[targetMain].durText;
-                    } else {
-                        exitStep = std::to_string(gA) + "," + initiators[targetMain].durText;
-                    }
-                } else {
-                    exitStep = std::to_string(initiators[targetMain].grade) + "," + initiators[targetMain].durText;
-                }
-
-                if (!stepTokens.empty()) {
-                    line += (glideFlags.empty() || !glideFlags.back() ? " " : "^");
-                }
-                line += exitStep;
-
-                // Repetition *N
-                if (prob(rng) < prof.repeatProb) {
-                    int reps = (style == STYLE_AMBIENT || style == STYLE_ACID_TECHNO) ? (prob(rng) < 0.5f ? 4 : 2) : 2;
-                    line += " *" + std::to_string(reps);
-                }
-
-                // Check length & syntax validity
-                if (line.size() <= (size_t)RULE_FIELD_MAX_CHARS) {
-                    RuleTable testTable;
-                    std::string err;
-                    if (parseRuleLine(line, testTable, err)) {
-                        finalRule = line;
-                        valid = true;
-                    }
-                }
-            }
-
-            if (!valid) {
-                int targetMain = cycleNext[i];
-                finalRule = std::to_string(initiators[i].grade) + "," + initiators[i].durText + " -> " +
-                            std::to_string(initiators[targetMain].grade) + "," + initiators[targetMain].durText;
-            }
-
-            fieldText[i] = finalRule;
-        }
-    }
-
     void randomizeRules() {
-        uint32_t seed = resolveSeed();
-        std::mt19937 genRng(seed);
-        generateRandomRules(genRng, (GenStyle)genStyle);
+        lgen::GeneratorConfig cfg;
+        cfg.numFields = NUM_FIELDS;
+        cfg.ruleFieldMaxChars = RULE_FIELD_MAX_CHARS;
+        cfg.listFieldMaxChars = LIST_FIELD_MAX_CHARS;
+        cfg.gradeMin = gradeMin;
+        cfg.gradeMax = gradeMax;
+
+        lgen::GeneratedRuleSet result =
+            lgen::generateAll((lgen::GenStyle)genStyle, seedText, cfg);
+
+        setRandomGradeListText(result.gradePool);
+        setRandomDurationListText(result.durationPool);
+
+        for (int i = 0; i < NUM_FIELDS && i < (int)result.rules.size(); i++) {
+            fieldText[i] = result.rules[i];
+        }
+
         recompileAll();
         resetAllEngines();
     }
 
+    
     // ---- Optional 'r' candidate lists -------------------------------------
+
+    // Pool 'r' of durations in rational form (pulses): num/den + weight. The
+    // conversion to subpulses occurs in recompileAll(), once the
+    // dynamic subdivision of the rule set is known.
+    struct RationalPoolEntry { long long num; long long den; double weight; };
+    std::vector<RationalPoolEntry> rDurationPoolRational;
 
     // Splits an optional trailing ':weight' off a pool entry. Returns the
     // value part (trimmed) and sets weight (default 1.0 if no ':' present).
@@ -607,7 +412,7 @@ struct LSystemModule : Module {
         return !out.empty();
     }
 
-    static bool parseDurationCsv(const std::string& raw, std::vector<WeightedPoolItem>& out) {
+    static bool parseDurationCsv(const std::string& raw, std::vector<RationalPoolEntry>& out) {
         out.clear();
         std::string t = trim(raw);
         if (t.empty()) return true; // empty = unrestricted, not an error
@@ -616,9 +421,10 @@ struct LSystemModule : Module {
             if (part.empty()) continue;
             std::string valStr; double weight;
             if (!splitPoolWeight(part, valStr, weight)) return false;
-            int ticks;
-            if (!parseDurationTicks(valStr, ticks)) return false;
-            out.push_back({ticks, weight});
+            long long num = 0, den = 1;
+            if (!parseDurationPulses(valStr, num, den)) return false;
+            if (num <= 0) return false;
+            out.push_back({num, den, weight});
         }
         return !out.empty();
     }
@@ -635,11 +441,13 @@ struct LSystemModule : Module {
 
     void setRandomDurationListText(const std::string& text) {
         rDurationListText = text;
-        std::vector<WeightedPoolItem> parsed;
+        std::vector<RationalPoolEntry> parsed;
         rDurationListError = !parseDurationCsv(text, parsed);
         if (!rDurationListError) {
-            std::lock_guard<std::mutex> lock(engineMutex);
-            for (int ch = 0; ch < MAX_CHANNELS; ch++) engines[ch].setRandomDurationList(parsed);
+            // The subdivision may change if this list provides new denominators.
+            // Recompile everything to maintain consistent keys and pools.
+            rDurationPoolRational = parsed;
+            recompileAll();
         }
     }
 
@@ -662,7 +470,7 @@ struct LSystemModule : Module {
 
     void setAutoResetSteps(int steps) {
         autoResetSteps = steps;
-        for (int ch = 0; ch < MAX_CHANNELS; ch++) autoResetPulseCount[ch] = 0;
+        aasPulseCounter = 0;
     }
 
     void setScale(int idx) {
@@ -670,6 +478,9 @@ struct LSystemModule : Module {
         if (idx < 0 || idx >= (int)presets.size()) return;
         scaleIndex = idx;
         scale = presets[idx].semitones;
+        // The adaptive resolution of the glide depends on the distance in
+        // semitones between degrees: recalculate with the new scale.
+        recompileAll();
     }
 
     void setRootNoteClass(int pitchClass) {
@@ -682,41 +493,41 @@ struct LSystemModule : Module {
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
             engines[ch].reset();
             ticksRemaining[ch] = 0;
+            alignHold[ch] = false;
             gateHigh[ch] = false;
             retrigSamplesLeft[ch] = 0;
-            autoResetPulseCount[ch] = 0;
             gliding[ch] = false;
             evalTriggered[ch] = false;
         }
         activeField = -1;
+        // Restart aligned to the NEXT clock edge: the sequence stays silent
+        // until the incoming pulse arrives, so it lands exactly ON the beat
+        // (same alignment as anything else clocked from the same source).
+        awaitingClockAfterReset = true;
+        aasPulseCounter = 0;
+        fracPos = 0.0;
+        nextBoundary = 1;
+        clockFrozen = false;
+        // Forget the detector's stale level: after this, only a genuine
+        // low->high transition of the clock line counts as a pulse.
+        clockTrigger.reset();
     }
 
-    void onClockTick(const ProcessArgs& args, int ch) {
-        // AAS (Autoreset After Steps): counts raw clock pulses, independent of
-        // the rule engine. 1 "step" = PPQN (48) pulses, matching the module's
-        // own tick resolution. When the threshold is reached, this channel is
-        // reset exactly like a Reset pulse.
-        if (autoResetSteps > 0) {
-            autoResetPulseCount[ch]++;
-            if (autoResetPulseCount[ch] >= autoResetSteps * PPQN) {
-                autoResetPulseCount[ch] = 0;
-                {
-                    std::lock_guard<std::mutex> lock(engineMutex);
-                    engines[ch].reset();
-                }
-                ticksRemaining[ch] = 0;
-                gateHigh[ch] = false;
-                retrigSamplesLeft[ch] = 0;
-                gliding[ch] = false;
-                if (ch == 0) activeField = -1;
-            }
-        }
-
+    void onInternalTick(const ProcessArgs& args, int ch, bool atPulse) {
         if (ticksRemaining[ch] > 0) {
             if (gliding[ch]) currentPitch[ch] += glideStepV[ch];
             ticksRemaining[ch]--;
             return;
         }
+
+
+        // Quantized subdivision transition to the beat: if D changes while
+        // this note was playing, hold the START of the next event until the
+        // next downbeat. Without this, an inner tick of the new grid
+        // would trigger the off-beat event and push the entire sequence
+        // out of phase with the clock until the next Reset.
+        if (!atPulse && alignHold[ch]) return;
+        alignHold[ch] = false;
 
         ResolvedEvent ev;
         bool got;
@@ -727,8 +538,8 @@ struct LSystemModule : Module {
                 float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
                 switch (evalMode) {
                     case EVAL_RULE_SELECT: {
-                        // Voltajes < -1V se tratan como "ignorar Eval": el L-System
-                        // continua su evaluacion natural, util con fuentes CV bipolares.
+                        // Voltages < -1V are treated as "ignore Eval": the L-System
+                        // continues its natural evaluation.
                         if (evalV >= -1.0f) {
                             int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
                             if (fieldKeyCommittedValid[targetRow]) {
@@ -792,10 +603,9 @@ struct LSystemModule : Module {
             float originPitch = (note - 60) / 12.f;
 
             // 'Fake slide': instead of sample-accurate interpolation, step the
-            // pitch by a fixed amount on every clock pulse across this note's
-            // duration, assuming the standard 48-PPQN tick resolution already
-            // used throughout the engine. Coarser on wide intervals or slow
-            // clocks, but needs no clock-speed detection or per-sample DSP.
+            // pitch by a fixed amount on every internal subpulse across this
+            // note's duration. Coarser on wide intervals or slow clocks, but
+            // needs no clock-speed detection or per-sample DSP.
             if (ev.hasGlide && !ev.glideTarget.isRest) {
                 int targetNote = degreeToNote(ev.glideTarget.value, scale, rootNote);
                 float targetPitch = (targetNote - 60) / 12.f;
@@ -812,6 +622,14 @@ struct LSystemModule : Module {
                 retrigSamplesLeft[ch] = (int)(args.sampleRate * 0.001f);
             }
             gateHigh[ch] = true;
+        }
+    }
+
+    // Fires one internal engine tick on every active channel. atPulse marks
+    // the downbeat tick generated by the incoming clock edge itself.
+    void fireInternalTick(const ProcessArgs& args, bool atPulse) {
+        for (int ch = 0; ch < numChannels; ch++) {
+            onInternalTick(args, ch, atPulse);
         }
     }
 
@@ -854,19 +672,18 @@ struct LSystemModule : Module {
                         float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
                         // Per-channel: if a polyphonic channel is negative, reset it normally.
                         if (evalV < -1.0f) {
-                            engines[ch].resetTo(fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                            engines[ch].resetTo(fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision});
                             ticksRemaining[ch] = 0; gateHigh[ch] = false;
-                            retrigSamplesLeft[ch] = 0; autoResetPulseCount[ch] = 0;
+                            retrigSamplesLeft[ch] = 0;
                             gliding[ch] = false; evalTriggered[ch] = false;
                             continue;
                         }
                         int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
-                        RuleKey targetKey = fieldKeyCommittedValid[targetRow] ? fieldKeyCommitted[targetRow] : (fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, PPQN});
+                        RuleKey targetKey = fieldKeyCommittedValid[targetRow] ? fieldKeyCommitted[targetRow] : (fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision});
                         engines[ch].resetToField(targetRow, targetKey);
                         ticksRemaining[ch] = 0;
                         gateHigh[ch] = false;
                         retrigSamplesLeft[ch] = 0;
-                        autoResetPulseCount[ch] = 0;
                         gliding[ch] = false;
                         evalTriggered[ch] = false;
                         if (ch == 0) activeField = targetRow;
@@ -879,11 +696,71 @@ struct LSystemModule : Module {
             }
         }
 
-        if (isRunning && inputs[CLOCK_INPUT].isConnected() &&
-            clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
-            for (int ch = 0; ch < numChannels; ch++) {
-                onClockTick(args, ch);
+        // ---- Clock front-end: 1 incoming pulse -> D internal subpulses ----
+        sampleCounter++;
+
+        if (isRunning && inputs[CLOCK_INPUT].isConnected()) {
+            if (clockTrigger.process(inputs[CLOCK_INPUT].getVoltage())) {
+                // Real flank of the clock: anchor the downbeat here. The measured interval
+                // is adopted directly (without heuristics); the gaps
+                // are glitches and are ignored.
+                if (lastEdgeSamplePos >= 0) {
+                    double gap = double(sampleCounter - lastEdgeSamplePos);
+                    if (!haveClockTempo) {
+                        if (gap >= (double)CLOCK_MIN_PULSE_SAMPLES) {
+                            samplesPerPulse = gap;
+                            haveClockTempo = true;
+                        }
+                    } else if (gap >= (double)CLOCK_MIN_PULSE_SAMPLES) {
+                        samplesPerPulse = gap;
+                    }
+                }
+                lastEdgeSamplePos = sampleCounter;
+
+                // AAS: counts complete pulses; the threshold falls right on a
+                // edge, so the restarted cycle starts aligned without
+                // needing to wait for another pulse.
+                if (autoResetSteps > 0 && ++aasPulseCounter >= autoResetSteps) {
+                    aasPulseCounter = 0;
+                    std::lock_guard<std::mutex> lock(engineMutex);
+                    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                        engines[ch].reset();
+                        ticksRemaining[ch] = 0;
+                        gateHigh[ch] = false;
+                        retrigSamplesLeft[ch] = 0;
+                        gliding[ch] = false;
+                        evalTriggered[ch] = false;
+                    }
+                    activeField = -1;
+                }
+
+                awaitingClockAfterReset = false;
+                clockFrozen = false;
+                // Real edge re-anchors phase: any remainder of pulse 
+                //previous is obsolete (if preserved, an early edge 
+                // would trigger a spurious internal tick right after the downbeat 
+                // and would freeze the rest of the pulse, stretching the current note).
+                fracPos = 0.0;
+                nextBoundary = 1;
+                fireInternalTick(args, true);
+            } else if (!awaitingClockAfterReset && !clockFrozen && haveClockTempo &&
+                       samplesPerPulse > 0.0) {
+                // Between edges: interpolate the inner limits of the pulse
+                // (subpulses 1..D-1). Upon reaching 1.0 WITHOUT a new edge, freeze
+                // and wait for the actual edge -- the module never runs faster
+                // than its clock and remains silent if the clock stops.
+                fracPos += 1.0 / samplesPerPulse;
+                int D = pulseSubdivision;
+                while (nextBoundary < D && fracPos * (double)D >= (double)nextBoundary) {
+                    fireInternalTick(args, false);
+                    nextBoundary++;
+                }
+                if (fracPos >= 1.0) clockFrozen = true;
             }
+        } else {
+            // Clock unplugged or module stopped: never stay armed forever,
+            // otherwise a later resume without resetOnRun would hold silently.
+            awaitingClockAfterReset = false;
         }
 
         outputs[PITCH_OUTPUT].setChannels(numChannels);
@@ -980,8 +857,21 @@ struct LSystemModule : Module {
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
             evalTriggered[ch] = false;
         }
+        // Clock front-end back to pristine: the tempo must be relearned from
+        // the next two incoming pulses.
+        haveClockTempo = false;
+        clockFrozen = false;
+        awaitingClockAfterReset = false;
+        fracPos = 0.0;
+        nextBoundary = 1;
+        lastEdgeSamplePos = -1;
+        samplesPerPulse = 0.0;
+        pulseSubdivision = 1;
+        aasPulseCounter = 0;
+        sampleCounter = 0;
         rGradeListText.clear();
         rDurationListText.clear();
+        rDurationPoolRational.clear();
         rGradeListError = false;
         rDurationListError = false;
         seedText.clear();
@@ -996,12 +886,7 @@ struct LSystemModule : Module {
 // WIDGET
 // =======================================================================
 
-// Fully custom text-field rendering: draws our own background (or none, for
-// a transparent field over the panel's own artwork), our own text color, and
-// a deterministically vertically-centered baseline (nvgTextAlign MIDDLE),
-// instead of relying on ui::TextField::draw()'s internal padding/positioning
-// -- which is what was causing text to clip out the bottom on short rows.
-// TUNE THESE to taste:
+
 static const NVGcolor QUO_FIELD_BG = nvgRGB(0x2a, 0x2a, 0x2a);   // dark gray fill; set alpha 0 (see below) for transparent
 static const NVGcolor QUO_FIELD_TEXT = nvgRGB(0xe8, 0xe8, 0xe8); // light/white text
 static const NVGcolor QUO_FIELD_CURSOR = nvgRGB(0xff, 0xcc, 0x30);
@@ -1344,19 +1229,10 @@ struct SeedTextField : ui::TextField {
 
 struct LSystemModuleWidget : ModuleWidget {
 
-
-
-
-    // All positions below come straight from the panel SVG's hidden
-    // "Reference" layer (jacks/buttons) and the rulesBack/rndDegressBack/
-    // rndDurationsBack rectangles (text fields), read directly out of the
-    // artwork so the code never has to eyeball pixel offsets against it.
     LSystemModuleWidget(LSystemModule* module) {
         setModule(module);
         setPanel(createPanel(asset::plugin(pluginInstance, "res/LSystem.svg")));
 
-
-        // Screws
         addChild(createWidget<ScrewBlack>(Vec(RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewBlack>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
         addChild(createWidget<ScrewBlack>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
@@ -1397,7 +1273,7 @@ struct LSystemModuleWidget : ModuleWidget {
             addChild(tf);
         }
 
-        // Fila 8: valores restringidos opcionales para 'r' (vacío = comportamiento actual)
+        // Row 8: optional restricted values for 'r' (empty = current behavior)
         static const float poolRows[2][4] = {
             {4.572f, 87.614f, 47.022f, 5.841f},  // degrees
             {52.917f, 87.614f, 48.948f, 5.841f}, // durations
@@ -1423,19 +1299,26 @@ struct LSystemModuleWidget : ModuleWidget {
             addChild(lf);
         }
 
-        //Texto de titulos separados en su svg para agregarlos a los ultimo y los overlay no lo tapen:
-        SvgWidget* titleText = new SvgWidget(); 
-        titleText->box.pos = mm2px(Vec(0.0f, 0.0f)); // Ajusta las coordenadas x e y según necesites
+        //Separate title text in your svg to add them to the last ones and the overlays do not cover it. 
+        //Wrapped in a FramebufferWidget: same as the panel, it renders to 
+        //2x and it is rescaled, so the text paths are minified smooth to the 
+        //zoom out instead of aliasing.
+        widget::FramebufferWidget* titleFb = new widget::FramebufferWidget;
+        titleFb->oversample = 2.0;
+        titleFb->box.pos = mm2px(Vec(0.0f, 0.0f));
+        SvgWidget* titleText = new SvgWidget();
         titleText->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/RulesTitleText.svg")));
-        addChild(titleText);
+        titleFb->addChild(titleText);
+        titleFb->box.size = titleText->box.size;
+        addChild(titleFb);
 
 
-        // Botones (momentáneos, con luz propia solo en Run)
+        // Buttons
         addParam(createParamCentered<QuoButton>(mm2px(Vec(33.582f, 101.469f)), module, LSystemModule::RUN_PARAM));
         addChild(createLightCentered<QuoButtonLight<GreenLight>>(mm2px(Vec(33.500f, 101.400f)), module, LSystemModule::RUN_LIGHT));
         addParam(createParamCentered<QuoButton>(mm2px(Vec(21.378f, 101.469f)), module, LSystemModule::RESET_PARAM));
 
-        // Entradas / Salidas (posiciones exactas leídas de la capa Reference)
+        // Inputs / Outputs
         addInput(createInputCentered<QuoJack>(mm2px(Vec(9.173f, 110.839f)), module, LSystemModule::CLOCK_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(21.387f, 110.839f)), module, LSystemModule::RESET_INPUT));
         addInput(createInputCentered<QuoJack>(mm2px(Vec(33.576f, 110.839f)), module, LSystemModule::RUN_INPUT));
@@ -1444,8 +1327,7 @@ struct LSystemModuleWidget : ModuleWidget {
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(57.913f, 110.839f)), module, LSystemModule::RULE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(85.283f, 110.815f)), module, LSystemModule::GATE_OUTPUT));
         addOutput(createOutputCentered<QuoJack>(mm2px(Vec(97.512f, 110.815f)), module, LSystemModule::PITCH_OUTPUT));
-        // Port/button labels ("Clk", "Rst", "Run", "V/Oct", "Gate", "EOR", "EOS")
-        // are baked into the panel art (insOutsText group) -- nothing to add here.
+        
     }
 
     void appendContextMenu(Menu* menu) override {
@@ -1492,13 +1374,13 @@ struct LSystemModuleWidget : ModuleWidget {
             }
         }));
 
-        menu->addChild(createSubmenuItem("Autoreset after steps (48 clock pulses each)", "", [=](Menu* menu) {
+        menu->addChild(createSubmenuItem("Autoreset after steps (each step = 1 beat)", "", [=](Menu* menu) {
             static const struct { const char* name; int steps; } opts[] = {
                 {"Off", 0},
-                {"8 steps = 384 pulses", 8},
-                {"16 steps = 768 pulses", 16},
-                {"32 steps = 1536 pulses", 32},
-                {"64 steps = 3072 pulses", 64}
+                {"8 beats", 8},
+                {"16 beats", 16},
+                {"32 beats", 32},
+                {"64 beats", 64}
             };
             for (auto& o : opts) {
                 menu->addChild(createCheckMenuItem(o.name, "",
@@ -1540,8 +1422,8 @@ struct LSystemModuleWidget : ModuleWidget {
 
         menu->addChild(createSubmenuItem("Randomize rules style", "", [=](Menu* menu) {
             static const struct { const char* name; LSystemModule::GenStyle style; } styles[] = {
-                {"Melodic (Song Form)", LSystemModule::STYLE_MELODIC},
-                {"Acid / Techno / Polyrhythmic", LSystemModule::STYLE_ACID_TECHNO},
+                {"Melodic", LSystemModule::STYLE_MELODIC},
+                {"Acid / Techno", LSystemModule::STYLE_ACID_TECHNO},
                 {"Ambient / Evolving", LSystemModule::STYLE_AMBIENT},
                 {"Complex L-System", LSystemModule::STYLE_COMPLEX_CHAOS},
             };

@@ -1,6 +1,6 @@
 # MorphfastMini — Manual
 
-**Plugin:** Quostate_test2 · **Module:** MorphfastMini
+**Plugin:** Quostate · **Module:** MorphfastMini
 
 MorphfastMini generates a voltage transition from an **Init** voltage to a **Target** voltage, shaped by a selectable **curve**, timed by an external **clock**, and fired manually or by a trigger. The duration of the transition is specified in whole clock pulses, making it easy to sync morphs to tempo.
 

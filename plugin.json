@@ -24,6 +24,13 @@
         "Function generator",
         "Utility"
       ]
+    },
+    {
+      "slug": "LS-Exp",
+      "name": "LS-Exp",
+      "description": "Expander for LSystem: external scale/root control, degree/step outputs and display",
+      "manualUrl": "https://github.com/HiddenSide/Quostate/blob/main/LS-Exp_manual_EN.md",
+      "tags": ["Expander", "Quantizer", "Utility"]
     }
 
   ]

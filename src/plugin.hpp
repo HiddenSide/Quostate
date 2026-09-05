@@ -6,3 +6,4 @@ using namespace rack;
 extern Plugin* pluginInstance;
 extern Model* modelLSystem;
 extern Model* modelMorphfastMini;
+extern Model* modelLSExp;

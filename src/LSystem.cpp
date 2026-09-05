@@ -4,8 +4,11 @@
 #include "MusicUtils.hpp"
 #include "components.hpp"
 #include "RuleGenerator.hpp"
+#include "LSystemExpander.hpp"
 #include <mutex>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <functional>
 #include <algorithm>
@@ -81,6 +84,8 @@ struct LSystemModule : Module {
     int rootNote = 60;
     int numChannels = 1;
     bool resetOnRun = true;
+    // Gate width as a fraction of the current step duration (0.05..1.0, default 0.5).
+    float gateWidth = 0.5f;
     // 0 = disabled: EOS fires only when the sequence "completes" (Rule 1, the
     // initiator, fires again). >0: measured in PULSES -- every (autoResetSteps)
     // incoming clock pulses this channel autoresets internally
@@ -115,8 +120,25 @@ struct LSystemModule : Module {
     // fractional remainder is carried over between pulses (never discarded), so
     // the average rate always matches the clock: no cumulative drift.
     static constexpr int64_t CLOCK_MIN_PULSE_SAMPLES = 64; // rejects glitches
-    int pulseSubdivision = 1;        // subpulses per pulse (recalculated when editing rules)
+    std::atomic<int> pulseSubdivision{GATE_MIN_SUBDIVISION}; // subpulses per pulse; atomic for audio-thread reads
+    std::atomic<bool> pendingRecompile{false}; // deferred recompile: set by UI, applied at next downbeat
+    std::atomic<bool> pendingReset{false};     // deferred engine reset (used by randomizeRules)
+
+    // Precomputed recompile data: heavy parsing done on UI thread, applied
+    // lightweight on the audio thread at the next downbeat.
+    struct PrecomputedRecompile {
+        RuleTable table;
+        std::unordered_map<RuleKey, int, RuleKeyHash> keyOrder;
+        std::unordered_map<RuleKey, std::vector<int>, RuleKeyHash> keyFieldIndices;
+        RuleKey initKey{GradeValue{false, 1}, GATE_MIN_SUBDIVISION};
+        std::vector<WeightedPoolItem> durPool;
+        int newSub = GATE_MIN_SUBDIVISION;
+        int oldSub = GATE_MIN_SUBDIVISION;
+        bool valid = false;
+    };
+    PrecomputedRecompile precomputed;
     double samplesPerPulse = 0.0;    // measured interval between edges, in samples
+    double lastAppliedSpp = 0.0;     // last tempo that was re-anchored (Part 3 / tempo change)
     int64_t lastEdgeSamplePos = -1;  // sampleCounter of the last edge
     double fracPos = 0.0;            // position [0..1+) within the current pulse
     int nextBoundary = 1;            // next inner limit of the pulse (1..D-1)
@@ -137,6 +159,43 @@ struct LSystemModule : Module {
     float ruleVoltage[MAX_CHANNELS] = {};
 
     dsp::PulseGenerator eorPulse[MAX_CHANNELS];
+
+    // ---- Expander (LS-Exp) ------------------------------------------------
+    // Persistent message buffers (never allocate per frame).
+    lsxp::ExpanderToLSystem fromExp;
+    lsxp::LSystemToExpander toExp;
+    // Decoded external scale, rebuilt when the expander payload changes.
+    // extIntervals: ascending offsets in volts from the external root, spanning
+    // one cycle; extLen = number of tones per cycle; extRootVoct = root pitch.
+    std::vector<float> extIntervals;
+    float extRootVoct = 0.f;
+    int extLen = 0;
+    bool useExternalScale = false;
+    // Root-only transposition: a root input with no corresponding scale input
+    // transposes the internal scale by (externalRoot - internalRoot) in volts.
+    float extRootOffset = 0.f;
+    // Absolute root override: when ROOT_IN is connected, the incoming root
+    // becomes the scale's tonic, replacing the module's internal root note.
+    bool absRootFromInput = false;
+    float absRootVoct = 0.f;
+    int extScaleMode = lsxp::MODE_STD_7CH;
+    // Event-driven expander I/O: the heavy decode/publish only runs when a
+    // rule step fires or the module resets, never at audio sample rate.
+    bool expanderDirty = true;
+    // Per-channel live state published to the expander.
+    int xpAbsDegree[MAX_CHANNELS] = {1, 1, 1, 1, 1, 1};
+    bool xpIsRest[MAX_CHANNELS] = {};
+    bool xpIsSilent[MAX_CHANNELS] = {};
+    int xpRuleIdx[MAX_CHANNELS] = {};
+    int xpStepRep[MAX_CHANNELS] = {};
+    int xpStepRepTotal[MAX_CHANNELS] = {1, 1, 1, 1, 1, 1};
+    int xpStepWhole[MAX_CHANNELS] = {};
+    int xpStepWholeTotal[MAX_CHANNELS] = {1, 1, 1, 1, 1, 1};
+    // Gate-width tracking: total ticks of the current step and elapsed ticks.
+    int stepTicksTotal[MAX_CHANNELS] = {1, 1, 1, 1, 1, 1};
+    int stepTickPos[MAX_CHANNELS] = {};
+    // Internal root as V/oct (C4 = 0V) for the expander payload.
+    float internalRootVoct() const { return (float)(rootNote - 60) / 12.f; }
 
     bool wasRunning = false;
 
@@ -180,8 +239,22 @@ struct LSystemModule : Module {
 
         recompileAll();
         resetAllEngines();
-        
 
+        // Expander message buffers (push pattern): the LS-Exp writes
+        // ExpanderToLSystem into OUR producer buffer; we read consumer.
+        leftExpander.producerMessage = new lsxp::ExpanderToLSystem;
+        leftExpander.consumerMessage = new lsxp::ExpanderToLSystem;
+        rightExpander.producerMessage = new lsxp::ExpanderToLSystem;
+        rightExpander.consumerMessage = new lsxp::ExpanderToLSystem;
+    }
+
+    ~LSystemModule() {
+        delete (lsxp::ExpanderToLSystem*)leftExpander.producerMessage;
+        delete (lsxp::ExpanderToLSystem*)leftExpander.consumerMessage;
+        delete (lsxp::ExpanderToLSystem*)rightExpander.producerMessage;
+        delete (lsxp::ExpanderToLSystem*)rightExpander.consumerMessage;
+        leftExpander.producerMessage = leftExpander.consumerMessage = nullptr;
+        rightExpander.producerMessage = rightExpander.consumerMessage = nullptr;
     }
 
     void recompileField(int idx, int subdiv) {
@@ -223,12 +296,15 @@ struct LSystemModule : Module {
         }
     }
 
-    void recompileAll() {
-        int oldSub = pulseSubdivision; // para migrar estado en curso si cambia
-        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
+    // Heavy parsing — runs on the UI thread so the audio thread is never
+    // blocked by regex / LCM / table building.  Stores results in the
+    // `precomputed` struct; the audio thread picks them up via the
+    // pendingRecompile flag and calls the lightweight applyRecompile().
+    void precomputeRecompile() {
+        int oldSub = pulseSubdivision.load(std::memory_order_relaxed);
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, oldSub);
 
-        // Step 1: Collect denominators of durations (rules + pool 'r')
-        // To derive the dynamic subdivision: LCM bounded by MAX_SUBDIVISION.
+        // Collect denominators (rules + pool 'r') for the LCM.
         std::vector<long long> dens;
         RuleTable tmpTable;
         std::string tmpErr;
@@ -247,15 +323,7 @@ struct LSystemModule : Module {
             D = next;
         }
 
-
-        // Glide resolution requirement ('^'): each step should not
-        // exceed ~25 cents. For each symbol with glideToNext and a predictable target
-        // (audible FIXED degrees + FIXED duration)
-        // D >= ceil(delta_semitones * steps/semitone * den / num) is required. Random degrees or
-        // durations only provide the absolute floor, because their
-        // target is unpredictable at compile time. The phase is
-        // re-anchored on each real edge, so raising D does not reintroduce drift:
-        // it only adds inner boundaries within the pulse.
+        // Glide resolution requirement.
         bool anyGlide = false;
         long long glideReq = 0;
         for (auto& kv : tmpTable) {
@@ -285,10 +353,10 @@ struct LSystemModule : Module {
             D = std::max(D, std::min(glideReq, (long long)MAX_SUBDIVISION));
             D = std::max(D, (long long)GLIDE_MIN_SUBDIVISION);
         }
-        pulseSubdivision = (int)D;
+        D = std::max(D, (long long)GATE_MIN_SUBDIVISION);
+        int newSub = (int)D;
 
-        // Refresh keys committed to the final subdivision.
-        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, pulseSubdivision);
+        for (int i = 0; i < NUM_FIELDS; i++) recompileField(i, newSub);
 
         RuleTable table;
         std::unordered_map<RuleKey, int, RuleKeyHash> keyOrder;
@@ -297,49 +365,70 @@ struct LSystemModule : Module {
             std::string t = trim(fieldTextCommitted[i]);
             if (t.empty()) continue;
             std::string err;
-            if (parseRuleLine(t, table, err, pulseSubdivision) && fieldKeyCommittedValid[i]) {
+            if (parseRuleLine(t, table, err, newSub) && fieldKeyCommittedValid[i]) {
                 keyOrder.emplace(fieldKeyCommitted[i], i);
                 keyFieldIndices[fieldKeyCommitted[i]].push_back(i);
             }
         }
+        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, newSub};
 
-        RuleKey initKey = fieldKeyCommittedValid[0] ? fieldKeyCommitted[0] : RuleKey{GradeValue{false, 1}, pulseSubdivision};
-
-        // Pool 'r' of durations: rational -> subpulses.
         std::vector<WeightedPoolItem> durPool;
         for (auto& e : rDurationPoolRational)
-            durPool.push_back(WeightedPoolItem(toSubpulses(e.num, e.den, pulseSubdivision), e.weight));
+            durPool.push_back(WeightedPoolItem(toSubpulses(e.num, e.den, newSub), e.weight));
+
+        // Store into precomputed (written by UI thread, read by audio thread
+        // only after the pendingRecompile acquire barrier).
+        precomputed.table = std::move(table);
+        precomputed.keyOrder = std::move(keyOrder);
+        precomputed.keyFieldIndices = std::move(keyFieldIndices);
+        precomputed.initKey = initKey;
+        precomputed.durPool = std::move(durPool);
+        precomputed.newSub = newSub;
+        precomputed.oldSub = oldSub;
+        precomputed.valid = true;
+    }
+
+    // Lightweight apply — runs on the audio thread at the downbeat under the
+    // engineMutex.  All heavy work was already done by precomputeRecompile().
+    void applyRecompile() {
+        if (!precomputed.valid) return;
+        int oldSub = precomputed.oldSub;
+        int newSub = precomputed.newSub;
+        bool subChanged = (oldSub != newSub);
 
         std::lock_guard<std::mutex> lock(engineMutex);
-        bool subChanged = (oldSub != pulseSubdivision);
         for (int ch = 0; ch < MAX_CHANNELS; ch++) {
-            engines[ch].setSubdivision(pulseSubdivision);
-        // Migrate the current state to the new drive BEFORE installing
-        // the tables: preserves the actual duration of the sounding note and the
-        // key matches, preventing audible jumps when editing on the fly.
-            engines[ch].migrateSubdivision(oldSub, pulseSubdivision);
-            engines[ch].setRules(table);
-            engines[ch].setKeyOrder(keyOrder);
-            engines[ch].setKeyFieldIndices(keyFieldIndices);
-            engines[ch].setInitiator(initKey);
+            engines[ch].setSubdivision(newSub);
+            engines[ch].migrateSubdivision(oldSub, newSub);
+            engines[ch].setRules(precomputed.table);
+            engines[ch].setKeyOrder(precomputed.keyOrder);
+            engines[ch].setKeyFieldIndices(precomputed.keyFieldIndices);
+            engines[ch].setInitiator(precomputed.initKey);
             engines[ch].setFallback(fallback);
             engines[ch].setGradeRange(gradeMin, gradeMax);
-            engines[ch].setRandomDurationList(durPool);
+            engines[ch].setRandomDurationList(precomputed.durPool);
         }
         if (subChanged) {
-            double r = (double)pulseSubdivision / (double)oldSub;
+            double r = (double)newSub / (double)oldSub;
             for (int ch = 0; ch < MAX_CHANNELS; ch++) {
                 if (ticksRemaining[ch] > 0)
                     ticksRemaining[ch] = std::max(1,
                         (int)llround((double)ticksRemaining[ch] * r));
-                // The glide step is per tick: if the ticks become more 
-                // fine, each step is shortened to preserve the interval.
                 glideStepV[ch] *= (float)(1.0 / r);
-                // Quantize the transition: the next event starts on the
-                //downbeat, not on an inner tick of the new grid.
                 alignHold[ch] = true;
             }
+            fracPos = 0.0;
+            nextBoundary = 1;
         }
+        pulseSubdivision.store(newSub, std::memory_order_release);
+        precomputed.valid = false;
+    }
+
+    // Combined path for lifecycle events (constructor, dataFromJson, onReset)
+    // where both phases run on the UI thread before / during audio activity.
+    void recompileAll() {
+        precomputeRecompile();
+        applyRecompile();
     }
 
 
@@ -367,8 +456,10 @@ struct LSystemModule : Module {
             fieldText[i] = result.rules[i];
         }
 
-        recompileAll();
-        resetAllEngines();
+        // Defer recompile + reset to next downbeat.
+        precomputeRecompile();
+        pendingRecompile.store(true, std::memory_order_release);
+        pendingReset.store(true, std::memory_order_release);
     }
 
     
@@ -444,16 +535,18 @@ struct LSystemModule : Module {
         std::vector<RationalPoolEntry> parsed;
         rDurationListError = !parseDurationCsv(text, parsed);
         if (!rDurationListError) {
-            // The subdivision may change if this list provides new denominators.
-            // Recompile everything to maintain consistent keys and pools.
             rDurationPoolRational = parsed;
-            recompileAll();
+            precomputeRecompile();
+            pendingRecompile.store(true, std::memory_order_release);
         }
     }
 
     void setFieldText(int idx, const std::string& text) {
         fieldText[idx] = text;
-        recompileAll();
+        // Precompute on the UI thread (heavy parsing), then defer only the
+        // lightweight engine-state swap to the next downbeat on the audio thread.
+        precomputeRecompile();
+        pendingRecompile.store(true, std::memory_order_release);
     }
 
     void setFallback(FallbackMode m) {
@@ -478,14 +571,175 @@ struct LSystemModule : Module {
         if (idx < 0 || idx >= (int)presets.size()) return;
         scaleIndex = idx;
         scale = presets[idx].semitones;
-        // The adaptive resolution of the glide depends on the distance in
-        // semitones between degrees: recalculate with the new scale.
-        recompileAll();
+        precomputeRecompile();
+        pendingRecompile.store(true, std::memory_order_release);
     }
 
     void setRootNoteClass(int pitchClass) {
         int octave = floorDiv(rootNote, 12);
         rootNote = octave * 12 + pitchClass;
+    }
+
+    // ---- Expander helpers -------------------------------------------------
+    // Priority per LSystem: right expander wins; otherwise left; otherwise none.
+    // The expander must be physically adjacent (Rack guarantees left/right
+    // pointers only for direct neighbors).
+    Module* findActiveExpander() {
+        if (rightExpander.module && rightExpander.module->model &&
+            rightExpander.module->model->slug == "LS-Exp")
+            return rightExpander.module;
+        if (leftExpander.module && leftExpander.module->model &&
+            leftExpander.module->model->slug == "LS-Exp")
+            return leftExpander.module;
+        return nullptr;
+    }
+
+    static float quantizeRootToScale(float rootV, const std::vector<float>& intervals) {
+        if (intervals.empty()) return rootV;
+        // Search across the real voltage range (octave replicas), not by modulo,
+        // so non-octave-repeating scales behave correctly.
+        float best = intervals[0];
+        float bestD = 1e9f;
+        for (int oct = -10; oct <= 10; oct++) {
+            for (float iv : intervals) {
+                float cand = iv + (float)oct;
+                float d = std::fabs(cand - rootV);
+                if (d < bestD) { bestD = d; best = cand; }
+            }
+        }
+        return best;
+    }
+
+    // Decode the raw expander payload into extIntervals/extRootVoct/extLen.
+    // Called when a new payload arrives; the result takes effect on the NEXT
+    // event per channel (the sounding step keeps its pitch until then).
+    void decodeExternalScale(const lsxp::ExpanderToLSystem& p) {
+        extScaleMode = p.scaleMode;
+        extIntervals.clear();
+        extLen = 0;
+        useExternalScale = false;
+        extRootOffset = 0.f;
+        absRootFromInput = false;
+        if (!p.active) return;
+
+        // LSystem Index: SCALE_IN ch0 carries a 0-10V index into the internal
+        // scale presets. Applies the internal scale switch; no external scale.
+        if (p.scaleMode == lsxp::MODE_LSYSTEM_INDEX) {
+            if (p.scaleConnected) {
+                auto& presets = getScalePresets();
+                int n = (int)presets.size();
+                int idx = (int)std::lround(p.scaleVoct[0] * (float)(n - 1) / 10.f);
+                if (idx >= 0 && idx < n && idx != scaleIndex) setScale(idx);
+            }
+            // Root input is the unique root for the selected internal scale.
+            absRootFromInput = p.rootConnected;
+            absRootVoct = p.rootVoct;
+            return;
+        }
+
+        std::vector<float> raw;
+        for (int i = 0; i < p.scaleChans && i < 16; i++) raw.push_back(p.scaleVoct[i]);
+
+        // Root-only case: no external scale, but a root input is connected.
+        // Transpose the internal scale by the requested root offset instead of
+        // switching to an external scale.
+        if (raw.empty()) {
+            // No external scale: the root input (if any) becomes the unique root
+            // of the internal scale; otherwise the module root is used.
+            absRootFromInput = p.rootConnected;
+            absRootVoct = p.rootVoct;
+            extRootOffset = 0.f;
+            useExternalScale = false;
+            return;
+        }
+
+        if (p.scaleMode == lsxp::MODE_CHROMATIC_12CH || p.scaleMode == lsxp::MODE_PENTA_CHROM_12CH) {
+            // Categorical 12ch: 0V=off, 8V=on, 10V=root. Channel i = semitone i.
+            int rootSemi = -1;
+            for (int i = 0; i < (int)raw.size() && i < 12; i++)
+                if (raw[i] >= 9.5f) rootSemi = i;
+            std::vector<int> semis;
+            for (int i = 0; i < (int)raw.size() && i < 12; i++)
+                if (raw[i] > 4.f) semis.push_back(i);
+            if (semis.empty()) return;
+            if (rootSemi < 0) {
+                // Embedded root missing: fall back to internal root class.
+                rootSemi = floorMod(rootNote, 12);
+            }
+            // Sort by distance from root, ascending pitch.
+            std::sort(semis.begin(), semis.end(), [&](int a, int b) {
+                int da = (a - rootSemi + 12) % 12, db = (b - rootSemi + 12) % 12;
+                return da < db;
+            });
+            for (int s : semis) {
+                int d = (s - rootSemi + 12) % 12;
+                extIntervals.push_back((float)d / 12.f);
+            }
+            float embRoot = (float)(rootSemi - floorMod(rootNote, 12)) / 12.f + internalRootVoct();
+            // Snap embedded root to exact semitone grid relative to C.
+            embRoot = std::round(embRoot * 12.f) / 12.f;
+            if (p.rootConnected) extRootVoct = quantizeRootToScale(p.rootVoct, extIntervals);
+            else extRootVoct = embRoot;
+            extLen = (int)extIntervals.size();
+            useExternalScale = extLen > 0;
+            return;
+        }
+        // Raw V/oct modes: sort ascending, deduplicate.
+        std::sort(raw.begin(), raw.end());
+        std::vector<float> uniq;
+        for (float v : raw) {
+            if (uniq.empty() || std::fabs(v - uniq.back()) > 0.0005f) uniq.push_back(v);
+        }
+        if (uniq.empty()) return;
+        if (p.scaleMode == lsxp::MODE_STD_7CH || p.scaleMode == lsxp::MODE_PENTA_5CH) {
+            // Lowest channel = default root; intervals relative to it.
+            float base = uniq[0];
+            for (float v : uniq) extIntervals.push_back(v - base);
+            float defRoot = base;
+            if (p.rootConnected) extRootVoct = quantizeRootToScale(p.rootVoct, extIntervals);
+            else extRootVoct = defRoot;
+            extLen = (int)extIntervals.size();
+            useExternalScale = extLen > 0;
+            return;
+        }
+        // Libre / microtonal: same, but explicitly ignore the internal 12-TET root.
+        {
+            float base = uniq[0];
+            for (float v : uniq) extIntervals.push_back(v - base);
+            float defRoot = base;
+            if (p.rootConnected) extRootVoct = quantizeRootToScale(p.rootVoct, extIntervals);
+            else extRootVoct = defRoot;
+            extLen = (int)extIntervals.size();
+            useExternalScale = extLen > 0;
+            return;
+        }
+    }
+
+    float extDegreeToPitch(int absDegree) const {
+        if (extLen < 1) return internalRootVoct();
+        int zb = absDegree - 1;
+        int d = floorDiv(zb, extLen);
+        int m = floorMod(zb, extLen);
+        return extRootVoct + extIntervals[m] + (float)d * 1.f;
+    }
+
+    // Pitch of a degree within the internal scale, measured from an arbitrary
+    // float root base (in V/oct). Octave advance is counted relative to that
+    // base, so a root override maps correctly regardless of the internal note.
+    float internalDegreeToPitch(int absDegree, float rootVoct) const {
+        int n = (int)scale.size();
+        if (n < 1) return rootVoct;
+        int zb = absDegree - 1;
+        int d = floorDiv(zb, n);
+        int m = floorMod(zb, n);
+        return rootVoct + (float)scale[m] / 12.f + (float)d * 1.f;
+    }
+
+    // The effective tonic of the internal scale: the incoming ROOT_IN value
+    // when connected (unique root), otherwise the module root plus offset.
+    float effectiveInternalRoot() const {
+        if (absRootFromInput) return absRootVoct;
+        return internalRootVoct() + extRootOffset;
     }
 
     void resetAllEngines() {
@@ -498,7 +752,19 @@ struct LSystemModule : Module {
             retrigSamplesLeft[ch] = 0;
             gliding[ch] = false;
             evalTriggered[ch] = false;
+            stepTicksTotal[ch] = 1;
+            stepTickPos[ch] = 0;
+            xpAbsDegree[ch] = 1;
+            xpIsRest[ch] = false;
+            xpIsSilent[ch] = false;
+            xpRuleIdx[ch] = 0;
+            xpStepRep[ch] = 0;
+            xpStepRepTotal[ch] = 1;
+            xpStepWhole[ch] = 0;
+            xpStepWholeTotal[ch] = 1;
         }
+        // Reset is an update event for the expander's published state.
+        expanderDirty = true;
         activeField = -1;
         // Restart aligned to the NEXT clock edge: the sequence stays silent
         // until the incoming pulse arrives, so it lands exactly ON the beat
@@ -517,6 +783,12 @@ struct LSystemModule : Module {
         if (ticksRemaining[ch] > 0) {
             if (gliding[ch]) currentPitch[ch] += glideStepV[ch];
             ticksRemaining[ch]--;
+            stepTickPos[ch]++;
+            // Gate width: drop the gate once the width fraction elapses,
+            // pitch keeps gliding/held until the step ends.
+            int gw = (int)std::round((float)stepTicksTotal[ch] * gateWidth);
+            if (gw < 1) gw = 1;
+            if (stepTickPos[ch] >= gw) gateHigh[ch] = false;
             return;
         }
 
@@ -531,6 +803,7 @@ struct LSystemModule : Module {
 
         ResolvedEvent ev;
         bool got;
+        do {
         {
             std::lock_guard<std::mutex> lock(engineMutex);
             if (engines[ch].isQueueEmpty() && inputs[EVAL_INPUT].isConnected()) {
@@ -538,8 +811,6 @@ struct LSystemModule : Module {
                 float evalV = inputs[EVAL_INPUT].getVoltage(ch < evalChans ? ch : 0);
                 switch (evalMode) {
                     case EVAL_RULE_SELECT: {
-                        // Voltages < -1V are treated as "ignore Eval": the L-System
-                        // continues its natural evaluation.
                         if (evalV >= -1.0f) {
                             int targetRow = std::max(0, std::min(NUM_FIELDS - 1, (int)std::round(evalV * (float)(NUM_FIELDS - 1) / 10.f)));
                             if (fieldKeyCommittedValid[targetRow]) {
@@ -588,27 +859,52 @@ struct LSystemModule : Module {
         }
 
         ticksRemaining[ch] = std::max(1, ev.key.durationTicks) - 1;
+        stepTicksTotal[ch] = std::max(1, ev.key.durationTicks);
+        stepTickPos[ch] = 0;
+
+        if (!ev.silent) {
+            xpAbsDegree[ch] = ev.key.grade.isRest ? 0 : ev.key.grade.value;
+            xpIsRest[ch] = ev.key.grade.isRest;
+            xpIsSilent[ch] = false;
+            xpRuleIdx[ch] = engines[ch].lastFiredFieldIndex;
+            xpStepRep[ch] = ev.stepIdxRep;
+            xpStepRepTotal[ch] = ev.stepTotalRep;
+            xpStepWhole[ch] = ev.stepIdxWhole;
+            xpStepWholeTotal[ch] = ev.stepTotalWhole;
+            expanderDirty = true;
+        } else {
+            xpIsSilent[ch] = true;
+        }
 
         if (ev.silent) {
-            // Duration-0 step kept only to drive rule-routing (see engine
-            // expandOnce()): consumes its floored tick, but must not appear
-            // as a note -- leave V/Oct and Gate untouched, and don't carry
-            // any glide-in-progress through it.
             gliding[ch] = false;
+            // Zero-duration routing step: the engine already advanced
+            // current to this step's grade (via nextEvent), so rule
+            // routing is correct.  Consume no tick — loop immediately
+            // to dequeue the actual next event in the same subpulse.
+            if (ticksRemaining[ch] == 0) continue;
         } else if (ev.key.grade.isRest) {
             gateHigh[ch] = false;
             gliding[ch] = false;
         } else {
-            int note = degreeToNote(ev.key.grade.value, scale, rootNote);
-            float originPitch = (note - 60) / 12.f;
+            float originPitch;
+            if (useExternalScale) {
+                originPitch = extDegreeToPitch(ev.key.grade.value);
+            } else {
+                originPitch = internalDegreeToPitch(ev.key.grade.value, effectiveInternalRoot());
+            }
 
             // 'Fake slide': instead of sample-accurate interpolation, step the
             // pitch by a fixed amount on every internal subpulse across this
             // note's duration. Coarser on wide intervals or slow clocks, but
             // needs no clock-speed detection or per-sample DSP.
             if (ev.hasGlide && !ev.glideTarget.isRest) {
-                int targetNote = degreeToNote(ev.glideTarget.value, scale, rootNote);
-                float targetPitch = (targetNote - 60) / 12.f;
+                float targetPitch;
+                if (useExternalScale) {
+                    targetPitch = extDegreeToPitch(ev.glideTarget.value);
+                } else {
+                    targetPitch = internalDegreeToPitch(ev.glideTarget.value, effectiveInternalRoot());
+                }
                 int ticks = std::max(1, ev.key.durationTicks);
                 glideStepV[ch] = (targetPitch - originPitch) / (float)ticks;
                 gliding[ch] = true;
@@ -623,6 +919,8 @@ struct LSystemModule : Module {
             }
             gateHigh[ch] = true;
         }
+        break;
+        } while (true);
     }
 
     // Fires one internal engine tick on every active channel. atPulse marks
@@ -634,6 +932,46 @@ struct LSystemModule : Module {
     }
 
     void process(const ProcessArgs& args) override {
+        // Capture whether an expander update was requested (a rule step fired
+        // or a reset in a recent frame). Both the decode (top) and the publish
+        // (bottom) run only when set, keeping all heavy expander work at
+        // musical-event rate instead of audio sample rate.
+        bool doExpander = expanderDirty;
+        expanderDirty = false;
+
+        // ---- Expander input: read the active LS-Exp payload (right wins) ----
+        // Event-driven: only runs when a rule step fired or a reset happened
+        // in a recent frame (doExpander). Never decodes at audio sample rate.
+        if (doExpander) {
+            Module* xp = findActiveExpander();
+            bool got = false;
+            if (xp) {
+                lsxp::ExpanderToLSystem* p = nullptr;
+                if (xp == rightExpander.module)
+                    p = (lsxp::ExpanderToLSystem*)rightExpander.consumerMessage;
+                else if (xp == leftExpander.module)
+                    p = (lsxp::ExpanderToLSystem*)leftExpander.consumerMessage;
+                if (p && p->active) {
+                    // Decode the latest payload; takes effect on the NEXT
+                    // dequeued event per channel, never mid-step.
+                    if (std::memcmp(p, &fromExp, sizeof(lsxp::ExpanderToLSystem)) != 0) {
+                        fromExp = *p;
+                        decodeExternalScale(fromExp);
+                    }
+                    got = true;
+                }
+            }
+            if (!got) {
+                if (fromExp.active || useExternalScale || extRootOffset != 0.f || absRootFromInput) {
+                    fromExp.active = false;
+                    useExternalScale = false;
+                    extRootOffset = 0.f;
+                    absRootFromInput = false;
+                    extIntervals.clear();
+                    extLen = 0;
+                }
+            }
+        }
         if (runButtonTrigger.process(params[RUN_PARAM].getValue())) {
             running = !running;
         }
@@ -717,6 +1055,24 @@ struct LSystemModule : Module {
                 }
                 lastEdgeSamplePos = sampleCounter;
 
+                // Tempo change (Part 3): if the measured pulse interval swung
+                // significantly, defer any in-flight event to the downbeat so a
+                // tempo change can't leave a note starting off-beat. The
+                // downbeat branch just below re-anchors the grid (fracPos/
+                // nextBoundary); alignHold only delays the NEXT event start.
+                // A >10% interval change marks a deliberate speed change and
+                // ignores cycle-to-cycle jitter.
+                {
+                    double spp = samplesPerPulse;
+                    if (haveClockTempo && spp > 0.0 && lastAppliedSpp > 0.0) {
+                        double d = spp / lastAppliedSpp;
+                        if (d < 0.9 || d > 1.1) {
+                            for (int ch = 0; ch < MAX_CHANNELS; ch++) alignHold[ch] = true;
+                        }
+                    }
+                    if (spp > 0.0) lastAppliedSpp = spp;
+                }
+
                 // AAS: counts complete pulses; the threshold falls right on a
                 // edge, so the restarted cycle starts aligned without
                 // needing to wait for another pulse.
@@ -742,6 +1098,14 @@ struct LSystemModule : Module {
                 // and would freeze the rest of the pulse, stretching the current note).
                 fracPos = 0.0;
                 nextBoundary = 1;
+                // Deferred recompile: apply BEFORE fireInternalTick so the new
+                // rules are in place when the downbeat event dequeues.
+                if (pendingRecompile.exchange(false)) {
+                    applyRecompile();
+                }
+                if (pendingReset.exchange(false)) {
+                    resetAllEngines();
+                }
                 fireInternalTick(args, true);
             } else if (!awaitingClockAfterReset && !clockFrozen && haveClockTempo &&
                        samplesPerPulse > 0.0) {
@@ -750,7 +1114,10 @@ struct LSystemModule : Module {
                 // and wait for the actual edge -- the module never runs faster
                 // than its clock and remains silent if the clock stops.
                 fracPos += 1.0 / samplesPerPulse;
-                int D = pulseSubdivision;
+                // Acquire ensures we see the complete grid state (fracPos=0,
+                // nextBoundary=1) that was written under the mutex before the
+                // release store of pulseSubdivision in applyRecompile().
+                int D = pulseSubdivision.load(std::memory_order_acquire);
                 while (nextBoundary < D && fracPos * (double)D >= (double)nextBoundary) {
                     fireInternalTick(args, false);
                     nextBoundary++;
@@ -761,6 +1128,15 @@ struct LSystemModule : Module {
             // Clock unplugged or module stopped: never stay armed forever,
             // otherwise a later resume without resetOnRun would hold silently.
             awaitingClockAfterReset = false;
+            // Apply deferred recompile even when stopped, so the user sees the
+            // new rules take effect. The grid is not mid-pulse, so there's no
+            // risk of desync.
+            if (pendingRecompile.exchange(false)) {
+                applyRecompile();
+            }
+            if (pendingReset.exchange(false)) {
+                resetAllEngines();
+            }
         }
 
         outputs[PITCH_OUTPUT].setChannels(numChannels);
@@ -779,6 +1155,56 @@ struct LSystemModule : Module {
             outputs[GATE_OUTPUT].setVoltage(gateV, ch);
             outputs[EOR_OUTPUT].setVoltage(eorPulse[ch].process(args.sampleTime) ? 10.f : 0.f, ch);
             outputs[RULE_OUTPUT].setVoltage(ruleVoltage[ch], ch);
+        }
+
+        // ---- Expander output: publish live state (LSystem -> LS-Exp) ----
+        // Event-driven (see doExpander above): publishes whenever a rule step
+        // fired or a reset happened, never at audio sample rate.
+        if (doExpander) {
+            Module* xp = findActiveExpander();
+            if (xp) {
+                toExp.active = true;
+                toExp.numChannels = numChannels;
+                toExp.scaleIndex = scaleIndex;
+                toExp.scaleLen = useExternalScale ? extLen : (int)scale.size();
+                toExp.rootVoct = useExternalScale ? extRootVoct : effectiveInternalRoot();
+                toExp.externalScale = useExternalScale;
+                for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+                    toExp.absDegree[ch] = xpAbsDegree[ch];
+                    toExp.isRest[ch] = xpIsRest[ch];
+                    toExp.isSilent[ch] = xpIsSilent[ch];
+                    toExp.ruleIdx[ch] = xpRuleIdx[ch];
+                    toExp.stepIdx[ch] = xpStepRep[ch];
+                    toExp.stepTotal[ch] = xpStepRepTotal[ch];
+                    toExp.stepIdxWhole[ch] = xpStepWhole[ch];
+                    toExp.stepTotalWhole[ch] = xpStepWholeTotal[ch];
+                }
+                // Active scale as voltages for SCALE_OUT thru.
+                toExp.scaleVoctChans = 0;
+                if (useExternalScale) {
+                    for (int i = 0; i < extLen && i < 16; i++)
+                        toExp.scaleVoct[i] = extRootVoct + extIntervals[i];
+                    toExp.scaleVoctChans = extLen > 16 ? 16 : extLen;
+                } else {
+                    float rootV = effectiveInternalRoot();
+                    // Quantize root to semitone grid for clean thru.
+                    float rq = std::round(rootV * 12.f) / 12.f;
+                    for (int i = 0; i < (int)scale.size() && i < 16; i++)
+                        toExp.scaleVoct[i] = rq + (float)scale[i] / 12.f;
+                    toExp.scaleVoctChans = (int)scale.size() > 16 ? 16 : (int)scale.size();
+                }
+                // Push into the expander's buffer facing us, then request flip
+                // (1-sample latency, handled by the engine at end of step).
+                if (xp == rightExpander.module && xp->leftExpander.producerMessage) {
+                    std::memcpy(xp->leftExpander.producerMessage, &toExp, sizeof(toExp));
+                    xp->leftExpander.messageFlipRequested = true;
+                } else if (xp == leftExpander.module && xp->rightExpander.producerMessage) {
+                    std::memcpy(xp->rightExpander.producerMessage, &toExp, sizeof(toExp));
+                    xp->rightExpander.messageFlipRequested = true;
+                }
+            } else {
+                toExp.active = false;
+            }
         }
     }
 
@@ -802,6 +1228,7 @@ struct LSystemModule : Module {
         json_object_set_new(rootJ, "seedText", json_string(seedText.c_str()));
         json_object_set_new(rootJ, "genStyle", json_integer(genStyle));
         json_object_set_new(rootJ, "evalMode", json_integer((int)evalMode));
+        json_object_set_new(rootJ, "gateWidth", json_real(gateWidth));
         return rootJ;
     }
 
@@ -842,6 +1269,8 @@ struct LSystemModule : Module {
         if (gsJ) genStyle = std::max(0, std::min((int)NUM_GEN_STYLES - 1, (int)json_integer_value(gsJ)));
         json_t* emJ = json_object_get(rootJ, "evalMode");
         if (emJ) evalMode = (EvalMode)std::max(0, std::min((int)NUM_EVAL_MODES - 1, (int)json_integer_value(emJ)));
+        json_t* gwJ = json_object_get(rootJ, "gateWidth");
+        if (gwJ) gateWidth = std::max(0.05f, std::min(1.f, (float)json_real_value(gwJ)));
         recompileAll();
         resetAllEngines();
     }
@@ -866,7 +1295,7 @@ struct LSystemModule : Module {
         nextBoundary = 1;
         lastEdgeSamplePos = -1;
         samplesPerPulse = 0.0;
-        pulseSubdivision = 1;
+        pulseSubdivision.store(GATE_MIN_SUBDIVISION, std::memory_order_relaxed);
         aasPulseCounter = 0;
         sampleCounter = 0;
         rGradeListText.clear();
@@ -1386,6 +1815,15 @@ struct LSystemModuleWidget : ModuleWidget {
                 menu->addChild(createCheckMenuItem(o.name, "",
                     [=]() { return m->autoResetSteps == o.steps; },
                     [=]() { m->setAutoResetSteps(o.steps); }));
+            }
+        }));
+
+        menu->addChild(createSubmenuItem("Gate width", string::f("%.0f%%", m->gateWidth * 100.f), [=](Menu* menu) {
+            static const int pcts[] = {10, 25, 50, 75, 90, 100};
+            for (int p : pcts) {
+                menu->addChild(createCheckMenuItem(string::f("%d%%", p), "",
+                    [=]() { return std::round(m->gateWidth * 100.f) == p; },
+                    [=]() { m->gateWidth = (float)p / 100.f; }));
             }
         }));
 

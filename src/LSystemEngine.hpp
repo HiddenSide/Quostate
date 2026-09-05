@@ -49,6 +49,13 @@ constexpr int MAX_SUBDIVISION = 96;
 constexpr int GLIDE_MIN_SUBDIVISION = 16;
 constexpr double GLIDE_STEPS_PER_SEMITONE = 4.0; // ≈25 cents per step
 
+// Minimum per-pulse subdivision so the "Gate width" menu (10/25/50/75/90/100%)
+// takes effect even on whole-pulse steps. 20 is the LCM of the width
+// denominators {10,4,2}, so every menu percentage maps to an exact number of
+// sub-steps. Safe: the downbeat stays anchored to the real clock edge; these
+// only add resolution inside the pulse (same mechanism glide already relies on).
+constexpr int GATE_MIN_SUBDIVISION = 20;
+
 inline long long gcdLL(long long a, long long b) {
     if (a < 0) a = -a;
     if (b < 0) b = -b;
@@ -109,6 +116,16 @@ struct ResolvedEvent {
     // (as the very last step of a production) purely so its grade can drive
     // rule-routing. The module must skip V/Oct + Gate updates for it.
     bool silent = false;
+    // Step indexing for the LS-Exp Step output. Precomputed at enqueue time:
+    // stepIdxRep/totalRep cover the current repetition only (counter resets
+    // to 0 at the beginning of each repetition); stepIdxWhole/totalWhole span
+    // the whole rule firing including all *N repetitions. Silent routing steps
+    // (silent == true) carry stale indices and must be ignored by the module
+    // (Step output freezes during them). Explicit 's' rests count normally.
+    int stepIdxRep = 0;
+    int stepTotalRep = 1;
+    int stepIdxWhole = 0;
+    int stepTotalWhole = 1;
 
     ResolvedEvent() = default;
     ResolvedEvent(RuleKey k) : key(k) {}
@@ -952,6 +969,8 @@ private:
         if (lastFiredFieldIndex == 0 && !suppressEndSignalsOnce) eosFired = true;
         suppressEndSignalsOnce = false;
 
+        // Stash for the whole rule firing so Step indices are exact.
+        std::vector<std::vector<ResolvedEvent>> repBuf(prod.repeatCount);
         for (int rep = 0; rep < prod.repeatCount; rep++) {
             size_t n = prod.symbols.size();
             std::vector<GradeValue> resolvedGrades(n);
@@ -1014,6 +1033,8 @@ private:
                 }
             }
 
+    // Stash this repetition's events so whole-rule totals are exact
+    // (random durations/fills resolve here, before indices are assigned).
     for (size_t i = 0; i < n; i++) {
         const Symbol& sym = prod.symbols[i];
 
@@ -1040,7 +1061,34 @@ private:
             ev.glideTarget = resolvedGrades[i + 1];
         }
 
-        queue.push_back(ev);
+        repBuf[rep].push_back(ev);
+    }
+}
+// Assign Step indices now that every repetition is resolved: per-rep totals
+// and the whole-rule total are exact (silent routing steps excluded).
+{
+    int whole = 0;
+    for (int rep = 0; rep < prod.repeatCount; rep++)
+        for (auto& e : repBuf[rep]) if (!e.silent) whole++;
+    if (whole < 1) whole = 1;
+    int wholeIdx = 0;
+    for (int rep = 0; rep < prod.repeatCount; rep++) {
+        int repTotal = 0;
+        for (auto& e : repBuf[rep]) if (!e.silent) repTotal++;
+        if (repTotal < 1) repTotal = 1;
+        int repIdx = 0;
+        for (auto& e : repBuf[rep]) {
+            e.stepTotalRep = repTotal;
+            e.stepTotalWhole = whole;
+            if (!e.silent) {
+                e.stepIdxRep = repIdx++;
+                e.stepIdxWhole = wholeIdx++;
+            } else {
+                e.stepIdxRep = repIdx;
+                e.stepIdxWhole = wholeIdx;
+            }
+            queue.push_back(e);
+        }
     }
 }
         return ExpandResult::PRODUCED;

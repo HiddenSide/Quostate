@@ -11,22 +11,24 @@ Up to 7 rules can be added in their respective text fields.
 Each rule field accepts up to 50 characters.
 A rule field beginning with `--` is ignored.
 
-If a currently active rule is modified or rewritten, the changes won't take effect until it finishes playing, including all of its repetitions. This lets you edit rules without stopping playback. Edits that change the module's internal resolution (for example, adding a fractional duration to a rule or to a random pool) are applied just as smoothly: the step currently playing keeps its exact length in musical time, and the new resolution takes effect starting on the next clock pulse. A rule entry is confirmed with Enter or when the text field loses focus. Focus is shown as a yellow highlight on the horizontal title bar of each rule. This bar turns red if the entered or modified rule contains a syntax error. It turns green whenever the module's first channel plays that rule.
+If a currently active rule is modified or rewritten, its new content (the degrees, durations, repetitions, and routing) won't take effect until that rule finishes playing as it was originally written — including all of its repetitions. The engine keeps playing the old copy to its end, so editing never interrupts the current phrasing. This lets you edit rules without stopping playback.
+
+An edit has a second, independent effect whenever it changes the module's internal resolution (for example, adding a fractional duration to a rule or to a random pool). Everything a rule will play — including random values from `r`/pools and `=T` fills — is decided when the rule is first expanded, for all of its `*N` repetitions at once. Queued events are therefore frozen: nothing you hear changes until the next time that rule is expanded again. The internal timing grid itself is switched in at the next clock pulse, and the steps already queued are re-scaled in exact proportion so they keep their musical length. This is bookkeeping to stay locked to the clock — it is not audible by itself. It only matters once new content is expanded under the new grid: the next time the edited rule is entered, or a new random draw from the edited pool. So in practice both effects of an edit — the new content and the new resolution — are first heard the next time the edited rule is played. A rule entry is confirmed with Enter or when the text field loses focus. Focus is shown as a yellow highlight on the horizontal title bar of each rule. This bar turns red if the entered or modified rule contains a syntax error. It turns green whenever the module's first channel plays that rule.
 
 The simplest format for specifying a rule is:
 Initiator (degree,duration), the pair of characters `->`, and the sequence in the form of degree,duration [space] degree,duration [space] degree,duration...
 
 ## An example using only the first rule field:
 
-`1,1->1,1 3,1/2 5,3 7,4`
+`1,1-> 1,1 3,1/2 5,3 7,4`
 
 Whatever comes before `->` is not sequenced, it's used to label whether this rule can be picked by another one. What comes after is the sequence. In this case: the first scale degree with a duration of 1 beat, the third with a duration of 1/2 beat, the fifth with a duration of 3 beats, and the seventh with a duration of 4 beats. Since the last degree was 7, if no rule is found with that degree as its initiator, this rule will repeat indefinitely.
 
 Let's add a second rule to the example, in the second text field (or any other), which together with the first would look like:
 
-`(Rule 1:) 1,1->1,1 3,1/2 5,3 7,4`
+`(Rule 1:) 1,1-> 1,1 3,1/2 5,3 7,4`
 
-`(Rule 2:) 7,1->5,1 1,1`
+`(Rule 2:) 7,1-> 5,1 1,1`
 
 Now, since the final degree of the first rule matches the initiator degree of Rule 2, the sequence will continue into Rule 2 once the duration of the last degree (4, in this case) ends.
 
@@ -47,7 +49,7 @@ The character `r` can be used to specify a random value at any step of a rule: i
 
 A character that complements `r` is `k`. When `k` is used in the degree, duration, or both, it takes the last value that `r` produced in that respective field — in the same rule or any previously executed rule — or defaults to 1 if `r` was never evaluated. Here:
 
-`1,1->r,r k,k`
+`1,1-> r,r k,k`
 
 `k` will repeat, in the second step, both the degree and the duration that were randomly selected in the first step.
 
@@ -59,22 +61,22 @@ An integer can be added to or subtracted from a degree (or from a list of degree
 
 An interesting use of these operators is combining them with `k`, to get a degree that's different from, but relative to, the last random degree evaluated. Example:
 
-`1,1->r,1 k+5,1 -3,1`
+`1,1-> r,1 k+5,1 -3,1`
 
 It's worth clarifying here that the `-` sign in -3 (third step) doesn't refer to a subtraction performed on each repetition, but to picking the degree one octave lower on the scale. Higher octaves are reached with degrees higher than the scale's last degree.
 
 ## Repeating rules with the `*` operator:
 Before evaluating its next target rule, a rule can repeat itself using the `*` character together with a number n of repetitions (no space between them, like this: `*n`), specified at the end of the rule. Example:
 
-`1,1->1,1 5,1 *4`
+`1,1-> 1,1 5,1 *4`
 
 This rule will repeat 4 times before evaluating the possible target of its last degree.
 
-**Only one `*n` operator is allowed per rule.** Using more than one in the same rule (e.g. `1,1->1,1 *2 2,1 *4`) is rejected as a syntax error, rather than silently letting the last one override the earlier one.
+**Only one `*n` operator is allowed per rule.** Using more than one in the same rule (e.g. `1,1-> 1,1 *2 2,1 *4`) is rejected as a syntax error, rather than silently letting the last one override the earlier one.
 
 When using more than one repetition in a rule, the results of the `+` and `-` operations are preserved across repeats. Example:
 
-`1,1->1,1 1+1,1 *4`
+`1,1-> 1,1 1+1,1 *4`
 
 This rule will sequence, with a duration of 1 beat each, the degrees 1 > 2 > 1 > 3 > 1 > 4 > 1 > 5 before repeating again or jumping to another rule.
 
@@ -83,15 +85,15 @@ The maximum repetition count is 256.
 ## Weighted random list:
 A list of degree (or duration) numbers enclosed between `<` and `>` can be specified at any step of a rule. Example:
 
-`3,1->1,1 <3,5,7,-3>,1`
+`3,1-> 1,1 <3,5,7,-3>,1`
 
 This will pick, with equal probability, one of those 4 degrees on every execution of the rule. In this case the duration for the chosen degree is always 1, but you could also write:
 
-`3,1->1,1 <3,5,7,-3>,<1,2>`
+`3,1-> 1,1 <3,5,7,-3>,<1,2>`
 
 Here every degree or duration number has equal probability of being chosen, i.e. a weight of 1. If you want one or more degrees to have a higher chance of being picked, you can use the `:` character followed by a weight number next to the values you want to adjust. Weights must be positive numbers. Higher weight means higher probability. Example:	
 
-`3,1-><r:0.25,5,7,k:2>,<1,2:0.5>`
+`3,1-> <r:0.25,5,7,k:2>,<1,2:0.5>`
 
 Note that both `r` (random degree or duration) and `k` (last `r` evaluated for degree or duration) can be used inside these lists.
 
@@ -112,7 +114,7 @@ The `^` must sit directly against the step it modifies, with no space in between
 ## Silences with the `s` character. Gate and V/Oct outputs:
 Every step of a rule sends the voltage corresponding to its degree to the module's V/Oct output, along with a gate that stays high until its specified duration ends. At the exact instant the next step begins, the gate is briefly deactivated for a very short time, to retrigger envelopes or any module connected to the Gate output that needs it.
 
-A step can be silenced by using the `s` character in place of the degree. This deactivates the Gate output for the duration of that step: `1,1->1,1 s,2 3,1`.
+A step can be silenced by using the `s` character in place of the degree. This deactivates the Gate output for the duration of that step: `1,1-> 1,1 s,2 3,1`.
 
 `s` can also be used as an initiator, allowing a rule to be triggered after a silence.
 
@@ -180,8 +182,8 @@ Maximum limit: 1,000,000 subpulses.
 These same format rules and limits apply exactly the same way to the values entered in the duration pool.
 
 Duration `0` works as a routing/skip marker. 
-If a step with duration `0` is not the very last step of the rule, it is omitted. 
-If it is the very last step, it is kept as a silent one-subpulse routing step, so its degree can still select the next rule.
+If a step with duration `0` is not the very last step of the rule, it is omitted.
+If it is the very last step, it is kept as a silent routing step so its degree can still select the next rule. This step is consumed instantly without consuming a tick, so it does not affect timing or phase.
 
 If `0` is used in the initiator of a rule, it becomes 1 subpulse.
 
@@ -224,7 +226,7 @@ There is currently no option to change the gate's duration, either as a fixed va
 
 ## Quick reference of example rules:
 
-**`1,1->1,2 -2,1/2 <1,3>,1 <1,3>,<1,2> r,r k+1,k`**
+**`1,1-> 1,2 -2,1/2 <1,3>,1 <1,3>,<1,2> r,r k+1,k`**
 
 `1,1` = Initiator: (Degree 1. Duration 1).
 
@@ -245,7 +247,7 @@ There is currently no option to change the gate's duration, either as a fixed va
 `k+1,k` = Step (Last r degree, increased by 1. Last r duration. (+ and - are not allowed for durations)).
 
 
-**`2,1-><1,2:5,3:2>,1 2+2,1 5,2^0,1 s,2 *4`**
+**`2,1-> <1,2:5,3:2>,1 2+2,1 5,2^0,1 s,2 *4`**
 
 
 `<1,2:5,3:2>,1` = Step (Weighted list: Degree 1, 2, or 3. Duration 1). Higher weight = higher probability.

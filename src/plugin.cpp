@@ -6,4 +6,5 @@ void init(Plugin* p) {
     pluginInstance = p;
     p->addModel(modelLSystem);
     p->addModel(modelMorphfastMini);
+    p->addModel(modelLSExp);
 }

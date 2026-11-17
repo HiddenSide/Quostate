@@ -10,7 +10,7 @@ If an LSystem has expanders on both sides, only the right one is active — the 
 - **SCALE**: monophonic/polyphonic copy of the active scale (mode-dependent, see *Scale formats*). Missing tones read 0.0V.
 - **ROOT**: monophonic. The current root note. By default as raw V/oct; optionally in Meander's circle-of-fifths "Root CV" format (see *Root and Degree output options*).
 
-### The `degree.octava` format (Meander-compatible)
+### The `degree.octava` format (Meander-compatible: [https://library.vcvrack.com/PS-PurrSoftware/Meander](https://library.vcvrack.com/PS-PurrSoftware/Meander)
 
 The **Degree** output reports the scale degree currently playing in the same packed decimal format Meander uses, so the two can talk to each other.
 
